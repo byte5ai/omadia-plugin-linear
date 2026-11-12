@@ -1,0 +1,17 @@
+{
+  // Declaration-only emit. The runtime JS comes from esbuild
+  // (scripts/build-zip.mjs); two emitters for the same file would be a drift
+  // source. Nothing consumes this package's types today — it is a leaf — but
+  // the manifest's `lifecycle.entry` sits next to a `.d.ts` for the same reason
+  // the connection package does: a plugin zip that ships JS without types is
+  // undebuggable from the host side.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "rootDir": "./src",
+    "outDir": "./dist"
+  },
+  "include": ["src/**/*.ts"]
+}

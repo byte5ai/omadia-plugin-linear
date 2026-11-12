@@ -1,0 +1,35 @@
+{
+  // Typecheck config: covers src/ AND tests/ so a broken test file is a red
+  // compiler, not a surprise at `node --test` time. Emit is a separate
+  // concern — see tsconfig.build.json, which narrows rootDir to src/.
+  //
+  // Both `paths` entries point at BUILT declarations of adjacent checkouts.
+  // `@omadia/integration-linear` therefore has to have run its own
+  // `npm run build` (or at least `tsc -p tsconfig.build.json`) before this
+  // package typechecks — the alternative is re-declaring `LinearClient` here,
+  // which is the drift the client contract exists to prevent.
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@omadia/plugin-api": ["../omadia/middleware/packages/plugin-api/dist/index.d.ts"],
+      "@omadia/integration-linear": ["../omadia-integration-linear/dist/plugin.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "dist", "out", "scripts", ".test-build"]
+}

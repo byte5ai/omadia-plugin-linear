@@ -1,0 +1,176 @@
+schema_version: "1"
+
+# ===========================================================================
+# @omadia/agent-linear — the Linear agent
+# ---------------------------------------------------------------------------
+# A `kind: agent` plugin: it owns the five Linear tools and the prompt partial,
+# and holds no credential. Linear is reached only through the Linear API
+# capability published by @omadia/integration-linear, which also holds the key.
+#
+# Sources of truth (do not guess):
+#   Client contract   ../omadia-integration-linear/INTEGRATION.md
+#   Runtime contract  omadia/middleware/packages/plugin-api/src/pluginContext.ts
+#   Package contract  omadia/middleware/assets/boilerplate/agent-integration/CLAUDE.md
+#   Packaging guide   omadia/docs/creating-plugins.md
+# ===========================================================================
+
+identity:
+  id: "@omadia/agent-linear" # === package.json "name"
+  kind: "agent"
+  # The orchestrator tool name is derived from the plugin id, not from this:
+  # `@omadia/agent-linear` loses its scope and its `agent-` prefix and becomes
+  # `query_linear`. The domain is the bucket the tool is filed under.
+  domain: "linear"
+  name: "Linear"
+  version: "0.1.1" # === package.json "version"
+  # Locale map, not a bare string (#885): a bare string is read as English, so
+  # German in this slot would surface as the English description in the Hub.
+  description:
+    en: "Works with Linear issues from any channel: searches and reads them, and creates, changes or comments on them after showing you a preview and getting your explicit go-ahead."
+    de: "Arbeitet aus jedem Kanal mit Linear-Aufgaben: sucht und liest sie und legt sie an, ändert sie oder kommentiert sie, nachdem eine Vorschau gezeigt und ausdrücklich bestätigt wurde."
+  authors:
+    - name: "byte5 GmbH"
+      email: "info@omadia.ai"
+      url: "https://omadia.ai"
+  license: "MIT"
+  categories:
+    - "productivity"
+    - "development"
+
+compat:
+  core: ">=1.0 <2.0"
+  node: ">=20"
+
+# Safe to activate for more than one Agent. Note what that does NOT buy: the
+# kernel keeps a single activation per plugin id, so the prepared-write store in
+# src/preparedWrites.ts is process-wide, not per orchestrator and not per
+# conversation. A token's only bounds are that it is unguessable, single-use and
+# ten minutes old — not that it belongs to the conversation it was previewed in.
+multi_instance: true
+privacy_class: "strict"
+
+# The credential chain. `ctx.secrets` resolves along this, which is why this
+# plugin never declares `linear_api_key` itself.
+depends_on:
+  - "@omadia/integration-linear"
+
+# The typed client. `requires:` (not `optional_requires:`) is correct here
+# because the provider's manifest really does declare `provides: ["linear.api@1"]`
+# — so the capability resolver can match it, order activation, and block an
+# install that would leave this agent without a Linear connection. Matching is
+# major-only; the caret is accepted and documents the intent.
+requires:
+  - "linear.api@^1"
+
+lifecycle:
+  entry: "dist/plugin.js" # exports `activate(ctx)` -> { toolkit, close }
+  uninstall_policy:
+    entities: "keep"
+    memory: "delete"
+    secrets: "delete"
+
+setup:
+  guide:
+    en: "Enter the key of the Linear team this agent should work in — the prefix of its issue keys, so 'OMA' for OMA-7. The Linear API key itself belongs to the Linear connection plugin and is not asked for here."
+    de: "Geben Sie das Kürzel des Linear-Teams ein, in dem dieser Agent arbeiten soll — den Präfix der Aufgabennummern, also »OMA« für OMA-7. Der Linear-API-Schlüssel gehört zum Plugin »Linear-Verbindung« und wird hier nicht abgefragt."
+  fields:
+    - key: "default_team_key"
+      type: "string"
+      required: true
+      label:
+        en: "Default team key"
+        de: "Standard-Teamkürzel"
+      help:
+        en: "The team used when a request does not name one. Visible in Linear under Settings, Teams, or as the prefix of any issue key."
+        de: "Das Team, das verwendet wird, wenn eine Anfrage keines nennt. In Linear unter Einstellungen, Teams sichtbar oder als Präfix jeder Aufgabennummer."
+      placeholder: "OMA"
+      pattern: "^[A-Za-z0-9]{2,10}$"
+      pattern_hint:
+        en: "Two to ten letters or digits, e.g. OMA."
+        de: "Zwei bis zehn Buchstaben oder Ziffern, z. B. OMA."
+  # `self_test: true` obliges a plugin to ship an `onConfigure` hook, and core
+  # never invokes one (nothing in middleware/ references it). The Linear
+  # connection already verifies the key in its own activate(); a second check
+  # here would only put Linear's availability on the boot path twice. A wrong
+  # team key surfaces on the first tool call, naming the keys that do exist.
+  self_test: false
+
+llm:
+  prefers:
+    - capabilities: ["tool_use"]
+      min_context: 100000
+      class: "frontier"
+      # Low, deliberately. This agent resolves names to records and then asks a
+      # person to confirm a preview; inventiveness in that loop shows up as an
+      # invented state name or a confirmation nobody gave.
+      temperature_hint: 0.1
+  fallback_allowed: true
+
+playbook:
+  when_to_use: >
+    Anything to do with Linear issues: what is assigned to someone, what is in
+    progress or already done, what an issue says and who commented on it, plus
+    creating an issue, changing its state, assignee, priority, title,
+    description or labels, and adding a comment. Every change is shown as a
+    preview first and applied only after the user confirms it in the same
+    conversation.
+  combines_with: []
+  not_for:
+    - "Issue trackers other than Linear (GitHub Issues, Jira)"
+    - "Deleting or archiving issues, and edits to project, cycle, estimate or parent"
+    - "Linear documents, attachments, initiatives and customers"
+    - "Acting on behalf of a specific person: every call acts as the API key's owner"
+  example_prompts:
+    - "What is assigned to me in Linear and still open?"
+    - "What does OMA-7 say, and has anyone commented on it?"
+    - "Create an issue in OMA: login fails on Safari, high priority."
+    - "Move OMA-7 to Done and assign it to me."
+    - "Add a comment to OMA-12 that the fix is on staging."
+
+entities:
+  produces: []
+  consumes: []
+
+# The system prompt. The runtime loads every prompt_partial, strips the
+# frontmatter, concatenates the parts and prepends a header built from
+# identity.name, identity.description and playbook.when_to_use. This package
+# returns no prompt string from code.
+skills:
+  - id: "linear-expert"
+    kind: "prompt_partial"
+    path: "skills/linear-expert.md"
+    description: "How the Linear agent is called, its vocabulary, the prepare/preview/commit rule every write has to follow, and how to read a tool error."
+    shareable: false
+
+permissions:
+  # No memory accessor: the agent keeps nothing between turns. The one piece of
+  # state it holds — the prepared-write store — is in-memory by design, because
+  # a token that survived a restart would outlive every conversation that could
+  # have confirmed it.
+  memory:
+    reads: []
+    writes: []
+  graph:
+    reads: []
+    writes: []
+  network:
+    # Empty on purpose. Egress happens inside the connection plugin, which owns
+    # the `api.linear.app` allow-list entry and the key. An entry here would
+    # grant this plugin a `ctx.http` it has no credential for.
+    outbound: []
+
+integrations: []
+
+jobs: []
+
+# No `capabilities:` block. For a `kind: agent` plugin the manifest loader
+# reads capability entries only to resolve the `canvas_output`,
+# `deterministic_action` and `event_emit` flags — none of which apply here —
+# while the tools the model sees come from the toolkit. Declaring the five
+# tools a second time as JSON Schema would be a copy that drifts from
+# src/toolkit.ts with nothing to catch it.
+
+ui:
+  settings_schema: null
+  commands: []
+  dashboard_cards: []

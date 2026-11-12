@@ -1,0 +1,37 @@
+{
+  "name": "@omadia/agent-linear",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/plugin.js",
+  "types": "dist/plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    }
+  },
+  "description": "Linear agent for the Omadia harness — five tools over the Linear API capability published by @omadia/integration-linear, with every write staged as a prepared write and applied only after the user confirms the preview.",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "build": "npm run typecheck && npm test && node scripts/build-zip.mjs",
+    "build:only": "node scripts/build-zip.mjs",
+    "clean": "rm -rf dist out .test-build *.tsbuildinfo"
+  },
+  "peerDependencies": {
+    "@omadia/plugin-api": "*",
+    "@omadia/integration-linear": "*",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
