@@ -43,6 +43,11 @@ import { LinearAgentError, quoted } from './errors.js';
  *  enough that the preview still describes the issue as it is. */
 export const PREPARED_WRITE_TTL_MS = 10 * 60 * 1000;
 
+/** How long an expired entry is kept after its expiry, only so that a late
+ *  yes is told "expired" rather than "nothing was prepared". A day covers a
+ *  user who answers the next morning; the entry is refused all the same. */
+export const EXPIRED_WRITE_KEPT_MS = 24 * 60 * 60 * 1000;
+
 /** Longest stretch of a preview a refusal quotes to say which change is
  *  already waiting. */
 const MAX_PENDING_PREVIEW_CHARS = 120;
@@ -135,7 +140,8 @@ export interface PreparedWriteStore {
   /** Read without consuming. For tests and diagnostics: the commit path must
    *  use {@link take}, or two concurrent commits could both see the entry. */
   peek(conversation: string): PreparedWriteEntry | undefined;
-  /** Drop every expired entry. Returns how many went. */
+  /** Drop every entry that expired more than {@link EXPIRED_WRITE_KEPT_MS}
+   *  ago. Returns how many went. */
   sweep(): number;
   /** Live (non-expired) entries. */
   size(): number;
@@ -145,6 +151,8 @@ export interface PreparedWriteStore {
 
 export interface PreparedWriteStoreOptions {
   readonly ttlMs?: number;
+  /** How long an expired entry is kept to answer a late yes. */
+  readonly expiredKeptMs?: number;
   /** Injectable clock. Tests move time instead of sleeping through a TTL. */
   readonly now?: () => number;
 }
@@ -153,6 +161,7 @@ export function createPreparedWriteStore(
   opts: PreparedWriteStoreOptions = {},
 ): PreparedWriteStore {
   const ttlMs = opts.ttlMs ?? PREPARED_WRITE_TTL_MS;
+  const expiredKeptMs = opts.expiredKeptMs ?? EXPIRED_WRITE_KEPT_MS;
   const now = opts.now ?? (() => Date.now());
   /** Keyed by conversation. */
   const entries = new Map<string, PreparedWriteEntry>();
@@ -163,12 +172,17 @@ export function createPreparedWriteStore(
    * close()'s 5 s budget, and a leaked one keeps the whole activation alive.
    * Expiry is enforced in `take()` regardless of whether a sweep has run, so
    * the sweep is only about not holding dead descriptors in memory.
+   *
+   * It drops an entry only well after its expiry. A sweep runs on every
+   * prepare in any conversation, and dropping an entry the moment it expired
+   * would turn a late yes in its own conversation into "nothing was
+   * prepared", when the true answer is "it expired, prepare it again".
    */
   function sweep(): number {
     const t = now();
     let dropped = 0;
     for (const [conversation, entry] of entries) {
-      if (entry.expiresAt <= t) {
+      if (entry.expiresAt + expiredKeptMs <= t) {
         entries.delete(conversation);
         dropped += 1;
       }
@@ -179,8 +193,9 @@ export function createPreparedWriteStore(
   return {
     stage(caller, write, preview) {
       sweep();
+      // An expired entry waits for nobody: it may be replaced in any turn.
       const waiting = entries.get(caller.conversation);
-      if (waiting !== undefined && waiting.preparedInTurn === caller.turn) {
+      if (waiting !== undefined && waiting.expiresAt > now() && waiting.preparedInTurn === caller.turn) {
         throw new PreparedWriteError(
           `A change is already waiting for the user's confirmation ('${quoted(waiting.preview, MAX_PENDING_PREVIEW_CHARS)}'). ` +
             'Nothing new was prepared. One change per confirmation: hand that one off now, name the ' +
@@ -202,16 +217,16 @@ export function createPreparedWriteStore(
       if (!entry) {
         throw new PreparedWriteError(
           'No change is waiting for confirmation in this conversation: none was prepared, it was ' +
-            'already committed, or a newer one replaced it. Nothing was written. Call ' +
+            'already committed, a newer one replaced it, or it expired more than a day ago. Nothing ' +
+            'was written. Call ' +
             'linear_prepare_write again, show the new preview, and commit only after the user confirms it.',
         );
       }
       const t = now();
       if (entry.expiresAt <= t) {
         entries.delete(caller.conversation);
-        const ageMin = Math.round((t - entry.expiresAt) / 60000);
         throw new PreparedWriteError(
-          `The prepared change expired ${ageMin > 0 ? `${String(ageMin)} minute(s)` : 'less than a minute'} ago ` +
+          `The prepared change expired ${age(t - entry.expiresAt)} ago ` +
             `(previews are valid for ${String(Math.round(ttlMs / 60000))} minutes). Nothing was written. ` +
             'Prepare the change again so the preview reflects the issue as it is now.',
         );
@@ -241,11 +256,24 @@ export function createPreparedWriteStore(
 
     size() {
       sweep();
-      return entries.size;
+      const t = now();
+      let live = 0;
+      for (const entry of entries.values()) {
+        if (entry.expiresAt > t) live += 1;
+      }
+      return live;
     },
 
     clear() {
       entries.clear();
     },
   };
+}
+
+/** How long ago something happened, in the unit a person would say it in. */
+function age(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return 'less than a minute';
+  if (minutes < 120) return `${String(minutes)} minute(s)`;
+  return `${String(Math.round(minutes / 60))} hour(s)`;
 }

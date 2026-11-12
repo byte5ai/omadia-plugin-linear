@@ -7,7 +7,7 @@ import {
   LinearAgentError,
   MAX_REFUSAL_CHARS,
   quoted,
-  rateLimitRefusal,
+  connectionRefusal,
   TOOL_REFUSAL_ERROR_NAME,
   toRefusalText,
 } from '../src/errors.js';
@@ -515,7 +515,7 @@ describe('a refusal always fits what the host passes on', () => {
 // ---------------------------------------------------------------------------
 
 describe('connection failures', () => {
-  for (const name of ['LinearAuthError', 'LinearGraphQLError', 'LinearApiError']) {
+  for (const name of ['LinearGraphQLError', 'LinearApiError']) {
     it(`${name} on a read stays withheld`, async () => {
       const secret = 'upstream said: token lin_api_abc for jane@example.com is invalid';
       const { toolkit } = setup({}, {}, {
@@ -611,12 +611,44 @@ describe('connection failures', () => {
     assert.match(await refusal(toolkit, 'linear_commit_write', {}), /^No change is waiting/);
   });
 
-  it('only a rate limit is turned into a refusal', () => {
-    assert.equal(rateLimitRefusal(connectionError('LinearAuthError', 'x'), 'y'), undefined);
-    assert.equal(rateLimitRefusal(new Error('LinearRateLimitError'), 'y'), undefined);
-    assert.equal(rateLimitRefusal('LinearRateLimitError', 'y'), undefined);
-    assert.ok(
-      rateLimitRefusal(connectionError('LinearRateLimitError', 'x'), 'y') instanceof LinearAgentError,
+  it('a rejected key on a read is a refusal that carries none of the response', async () => {
+    const { toolkit } = setup({}, {}, {
+      async searchIssues() {
+        throw connectionError('LinearAuthError', 'upstream said: token lin_api_abc is invalid');
+      },
+    });
+    const text = await refusal(toolkit, 'linear_search_issues', {});
+    assert.equal(
+      text,
+      'Linear rejected the API key of the Linear connection, so the request was turned away. ' +
+        'Nothing was read. Do not retry: tell the user that an operator has to replace the key in ' +
+        "the Linear connection's settings.",
     );
+    assertPassable(text);
+  });
+
+  it('a rejected key on commit says the prepared change is used up, and it is', async () => {
+    const { toolkit, store, turns } = setup({}, {}, {
+      async addComment() {
+        throw connectionError('LinearAuthError', 'Authentication required');
+      },
+    });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x' });
+    turns.next();
+
+    const text = await refusal(toolkit, 'linear_commit_write', {});
+    assert.match(text, /^Linear rejected the API key.*Nothing was written, and the prepared change is used up\. Do not retry/);
+    assert.ok(!text.includes('Authentication required'));
+    assert.equal(store.peek(CONVERSATION), undefined);
+  });
+
+  it('only a rate limit and a rejected key are turned into a refusal', () => {
+    const turnedAway = { outcome: 'x', later: 'y' };
+    assert.equal(connectionRefusal(connectionError('LinearGraphQLError', 'x'), turnedAway), undefined);
+    assert.equal(connectionRefusal(new Error('LinearRateLimitError'), turnedAway), undefined);
+    assert.equal(connectionRefusal('LinearAuthError', turnedAway), undefined);
+    for (const name of ['LinearRateLimitError', 'LinearAuthError']) {
+      assert.ok(connectionRefusal(connectionError(name, 'x'), turnedAway) instanceof LinearAgentError);
+    }
   });
 });

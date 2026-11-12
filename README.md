@@ -146,8 +146,17 @@ Properties this buys, and where they are enforced (`src/preparedWrites.ts`):
 - **It expires after ten minutes.** A preview describes the issue as it was
   when the preview was rendered; past that, the write dies rather than
   applying a change the user agreed to against a different state of the world.
+  An expired write is kept for a day without being committable, so a late yes
+  is told "expired, prepare it again" instead of "nothing was prepared".
 - **Nothing survives a restart or a deactivate.** The store is in-memory and
   `close()` clears it.
+
+**"No" does not discard a prepared change.** When the user declines, the
+orchestrator usually answers without calling the Linear agent, so the change
+stays staged. It ends in one of three ways: it expires after ten minutes, a
+newer prepare in the same conversation replaces it, or it is committed. Until
+then a later yes in the same conversation could still apply it — the preview
+the user declined.
 
 What the gate does **not** decide is whether the user said yes. That is the
 orchestrator's reading of the user's message, and the Linear agent's reading
@@ -269,9 +278,12 @@ appear with no arguments at all.
   that says what to do next is never the part that gets cut; a shortened list
   says how many entries there are and points at `linear_lookup`. And a refusal
   is only ever thrown when nothing was written. Errors from the connection are
-  not refusals and stay withheld, with one exception: a rate limit, which is
-  reported with a text written here and the reset time, because Linear turned
-  the request away and "wait" is something a person can act on. On a host older
+  not refusals and stay withheld, with two exceptions, both cases where Linear
+  turned the request away before doing anything: a rate limit, reported with
+  the reset time, because "wait" is something a person can act on; and a
+  rejected API key, because only an operator can fix it and the model must
+  not retry. Both are texts written here; nothing of Linear's response is
+  passed on. On a host older
   than this rule a refusal is withheld like any other error.
 - **`assignee: "none"` clears the assignee**, on `update_issue` only. The
   editable set includes the assignee and the client documents `assigneeId: null`

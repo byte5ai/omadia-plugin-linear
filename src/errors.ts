@@ -24,9 +24,10 @@
  *
  * That is a different kind of failure from the error types the connection
  * raises. Those mean the request to Linear failed and stay withheld; these
- * mean the request never should have been made. Keeping them in separate
- * hierarchies is what lets a caller tell "your instruction was ambiguous" from
- * "Linear rejected the key".
+ * mean the request never should have been made. Two connection failures are
+ * the exception, because Linear turned the request away before doing
+ * anything: a rate limit and a rejected key are restated as refusals in
+ * {@link connectionRefusal}, in words written here.
  */
 
 /** The `name` the host's tool bridge recognises a refusal by. */
@@ -74,24 +75,47 @@ export class LinearAgentError extends Error {
   }
 }
 
+/** What a call that Linear turned away left behind, and what to do about a
+ *  wait. Per tool, because a commit has to say that its prepared change is
+ *  used up: a model that only hears "try again later" would commit a change
+ *  that no longer waits. */
+export interface TurnedAway {
+  /** "Nothing was read.", "Nothing was written, and …". */
+  readonly outcome: string;
+  /** The next step after a rate limit. */
+  readonly later: string;
+}
+
 /**
- * The refusal for a rate limit reported by the Linear connection, or
+ * The refusal for a connection failure the model is told about, or
  * `undefined` for any other error.
  *
- * A rate limit is the one connection failure worth telling the model about:
- * Linear turned the request away, so nothing was read or written, and "wait"
- * is something a person can act on. The text is written here and carries no
- * part of Linear's response. Recognised by name because the connection is a
- * separate bundle whose classes this package only knows as types.
+ * Two failures qualify, both because Linear turned the request away before
+ * doing anything, so nothing was read or written, and both have a next step a
+ * person can act on:
+ *
+ * - a rate limit: wait, then try again;
+ * - a rejected API key: an operator has to replace it. Retrying cannot help.
+ *
+ * The text is written here and carries no part of Linear's response. The
+ * errors are recognised by name because the connection is a separate bundle
+ * whose classes this package only knows as types.
  */
-export function rateLimitRefusal(err: unknown, consequence: string): LinearAgentError | undefined {
-  if (!(err instanceof Error) || err.name !== 'LinearRateLimitError') return undefined;
+export function connectionRefusal(err: unknown, turnedAway: TurnedAway): LinearAgentError | undefined {
+  if (!(err instanceof Error)) return undefined;
+  if (err.name === 'LinearAuthError') {
+    return new LinearAgentError(
+      `Linear rejected the API key of the Linear connection, so the request was turned away. ${turnedAway.outcome} ` +
+        "Do not retry: tell the user that an operator has to replace the key in the Linear connection's settings.",
+    );
+  }
+  if (err.name !== 'LinearRateLimitError') return undefined;
   const resetAt = (err as { resetAt?: unknown }).resetAt;
   const reset =
     resetAt instanceof Date && !Number.isNaN(resetAt.getTime())
       ? ` The limit resets at ${resetAt.toISOString()}.`
       : '';
   return new LinearAgentError(
-    `Linear is rate-limiting this API key, so the request was turned away.${reset} ${consequence}`,
+    `Linear is rate-limiting this API key, so the request was turned away.${reset} ${turnedAway.outcome} ${turnedAway.later}`,
   );
 }

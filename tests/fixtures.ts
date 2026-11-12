@@ -201,6 +201,8 @@ export function makeIssue(overrides: Partial<LinearIssueDetail> = {}): LinearIss
     priorityLabel: 'Medium',
     createdAt: '2026-09-01T08:00:00.000Z',
     updatedAt: '2026-09-05T09:30:00.000Z',
+    completedAt: undefined,
+    canceledAt: undefined,
     state: { id: STATE_TODO.id, name: STATE_TODO.name, type: STATE_TODO.type },
     assignee: { id: VIEWER.id, name: VIEWER.name, displayName: VIEWER.displayName },
     team: TEAM_OMA,

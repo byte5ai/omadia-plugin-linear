@@ -431,6 +431,8 @@ describe('linear_search_issues', () => {
     assert.equal(out['count'], 1);
     assert.deepEqual(Object.keys(issues[0] ?? {}).sort(), [
       'assignee',
+      'canceledAt',
+      'completedAt',
       'cycle',
       'key',
       'labels',
@@ -610,6 +612,21 @@ describe('linear_get_issue', () => {
     assert.equal(out['description'], 'Safari 17 rejects the session cookie.');
     assert.equal(out['commentCount'], 2);
     assert.equal((out['comments'] as unknown[]).length, 2);
+  });
+
+  it('says when an issue was completed, and null while it is open or for an older connection', async () => {
+    const { toolkit } = setup({
+      issues: [
+        makeIssue({ completedAt: '2026-11-12T15:55:49.337Z' }),
+        makeIssue({ id: 'issue-8', identifier: 'OMA-8', canceledAt: '2026-11-10T09:00:00.000Z' }),
+      ],
+    });
+    const done = await run(toolkit, 'linear_get_issue', { key: 'OMA-7' });
+    assert.equal(done['completedAt'], '2026-11-12T15:55:49.337Z');
+    assert.equal(done['canceledAt'], null);
+    const canceled = await run(toolkit, 'linear_get_issue', { key: 'OMA-8' });
+    assert.equal(canceled['completedAt'], null);
+    assert.equal(canceled['canceledAt'], '2026-11-10T09:00:00.000Z');
   });
 
   it('shows the project and the cycle of an issue that has them', async () => {

@@ -47,7 +47,9 @@ you pass. Pass what the question names and leave the rest out.
   `completedAfter`.
 - **Closed** (*erledigt*, *abgeschlossen*) is `stateType: completed`, and
   `completedAfter` says since when. A canceled issue has no completion time:
-  find it with `stateType: canceled` and `updatedAfter`.
+  find it with `stateType: canceled` and `updatedAfter`. Every issue result
+  carries `completedAt` and `canceledAt`: when it was closed, `null` while
+  it is open.
 - **Waiting in triage** is `stateType: triage`.
 
 A result is one page. `hasMore: true` says that more issues match than you

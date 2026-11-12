@@ -5,6 +5,7 @@ import type { Caller } from '../src/caller.js';
 import { LinearAgentError } from '../src/errors.js';
 import {
   createPreparedWriteStore,
+  EXPIRED_WRITE_KEPT_MS,
   PREPARED_WRITE_TTL_MS,
   PreparedWriteError,
   type PreparedWrite,
@@ -196,18 +197,57 @@ describe('createPreparedWriteStore', () => {
     assert.equal(store.peek('a'), undefined);
   });
 
-  it('sweeps expired entries and leaves live ones', () => {
+  it('sweeps entries long past their expiry and leaves live ones', () => {
     const clock = fixedClock();
-    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000, expiredKeptMs: 120_000 });
     store.stage(TURN_1, WRITE, 'old');
 
     clock.advance(30_000);
     store.stage(ELSEWHERE, WRITE, 'fresh');
     clock.advance(30_001);
 
+    assert.equal(store.sweep(), 0, 'just expired: kept to answer a late yes');
+    assert.equal(store.size(), 1, 'size counts live entries only');
+
+    clock.advance(120_000);
     assert.equal(store.sweep(), 1);
-    assert.equal(store.size(), 1);
-    assert.equal(store.peek('b')?.preview, 'fresh');
+    assert.equal(store.size(), 0);
+  });
+
+  it('tells a late yes that its write expired, after another conversation prepared one', () => {
+    // A prepare anywhere sweeps. It must not erase the expired entry of a
+    // conversation whose user is about to answer.
+    const clock = fixedClock();
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    store.stage(TURN_1, WRITE, 'mine');
+
+    clock.advance(6 * 60_000);
+    store.stage(ELSEWHERE, WRITE, 'theirs');
+    clock.advance(20 * 60_000);
+
+    refuses(() => store.take(TURN_2), /expired 25 minute\(s\) ago.*Nothing was written/s);
+    refuses(() => store.take(TURN_2), /No change is waiting/);
+  });
+
+  it('names an old expiry in hours', () => {
+    const clock = fixedClock();
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    store.stage(TURN_1, WRITE, 'mine');
+
+    clock.advance(60_000 + 5 * 60 * 60_000);
+
+    refuses(() => store.take(TURN_2), /expired 5 hour\(s\) ago/);
+  });
+
+  it('forgets an expired write after a day', () => {
+    const clock = fixedClock();
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    store.stage(TURN_1, WRITE, 'mine');
+
+    clock.advance(60_000 + EXPIRED_WRITE_KEPT_MS);
+    store.stage(ELSEWHERE, WRITE, 'theirs');
+
+    refuses(() => store.take(TURN_2), /No change is waiting.*expired more than a day ago/s);
   });
 
   it('drops everything on clear, so nothing outlives a deactivate', () => {

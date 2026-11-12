@@ -16,7 +16,7 @@ import { z } from 'zod';
 
 import type { CallerReader } from './caller.js';
 import { decodeCursor, encodeCursor } from './cursor.js';
-import { LinearAgentError, quoted, rateLimitRefusal } from './errors.js';
+import { connectionRefusal, LinearAgentError, quoted, type TurnedAway } from './errors.js';
 import { createLinearLookups, cycleLabel, type LinearLookups } from './lookup.js';
 import {
   createPreparedWriteStore,
@@ -360,6 +360,9 @@ function summariseIssue(issue: LinearIssue): Record<string, unknown> {
     project: issue.project?.name ?? null,
     cycle: issue.cycle === undefined ? null : cycleLabel(issue.cycle),
     updatedAt: issue.updatedAt,
+    // `null` while open, and from a connection older than these fields.
+    completedAt: issue.completedAt ?? null,
+    canceledAt: issue.canceledAt ?? null,
     url: issue.url,
   };
 }
@@ -609,7 +612,7 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
   };
 
   return {
-    tools: [searchIssues, getIssue, lookup, ...writeTools[opts.writeMode]].map(reportingRateLimits),
+    tools: [searchIssues, getIssue, lookup, ...writeTools[opts.writeMode]].map(reportingConnectionRefusals),
     async close() {
       // Deactivation drops every staged write: a descriptor surviving an
       // uninstall would be worse than useless.
@@ -632,40 +635,50 @@ function noConversation(): LinearAgentError {
 }
 
 // ---------------------------------------------------------------------------
-// rate limits: the one connection failure the model is told about
+// connection failures the model is told about: rate limit, rejected key
 // ---------------------------------------------------------------------------
 
-/** What a rate limit means for the call it interrupted. A commit is the case
- *  that must not be left to inference: the prepared change is gone (see
- *  `take()`), and a model that only hears "try again later" would commit a
- *  change that no longer waits. */
-const RATE_LIMIT_CONSEQUENCE: Readonly<Record<string, string>> = {
-  linear_prepare_write: 'Nothing was prepared. Tell the user, and prepare the change again later.',
-  linear_commit_write:
-    'Nothing was written, and the prepared change is used up. Tell the user, then prepare the change ' +
-    'again later and ask for a new confirmation.',
-  linear_write: 'Nothing was written. Tell the user, and try the change again later.',
+/** What a call Linear turned away left behind, per write tool. A commit is
+ *  the case that must not be left to inference: the prepared change is gone
+ *  (see `take()`). */
+const TURNED_AWAY: Readonly<Record<string, TurnedAway>> = {
+  linear_prepare_write: {
+    outcome: 'Nothing was prepared.',
+    later: 'Tell the user, and prepare the change again later.',
+  },
+  linear_commit_write: {
+    outcome: 'Nothing was written, and the prepared change is used up.',
+    later: 'Tell the user, then prepare the change again later and ask for a new confirmation.',
+  },
+  linear_write: {
+    outcome: 'Nothing was written.',
+    later: 'Tell the user, and try the change again later.',
+  },
 };
-const RATE_LIMIT_READ_CONSEQUENCE = 'Nothing was read. Tell the user, and try again later.';
+const READ_TURNED_AWAY: TurnedAway = {
+  outcome: 'Nothing was read.',
+  later: 'Tell the user, and try again later.',
+};
 
 /**
- * Turn a rate limit from the connection into a refusal the model can read.
+ * Turn a rate limit or a rejected key from the connection into a refusal the
+ * model can read.
  *
  * Every other error from the connection passes through untouched and stays
  * withheld by the host: its message is Linear's, not ours, and after a failed
  * mutation the outcome really is unknown.
  */
-function reportingRateLimits(
+function reportingConnectionRefusals(
   tool: ToolDescriptor<unknown, unknown>,
 ): ToolDescriptor<unknown, unknown> {
-  const consequence = RATE_LIMIT_CONSEQUENCE[tool.id] ?? RATE_LIMIT_READ_CONSEQUENCE;
+  const turnedAway = TURNED_AWAY[tool.id] ?? READ_TURNED_AWAY;
   return {
     ...tool,
     async run(input) {
       try {
         return await tool.run(input);
       } catch (err) {
-        throw rateLimitRefusal(err, consequence) ?? err;
+        throw connectionRefusal(err, turnedAway) ?? err;
       }
     },
   };
