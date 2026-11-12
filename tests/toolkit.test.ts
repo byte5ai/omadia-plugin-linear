@@ -3,10 +3,12 @@ import { describe, it } from 'node:test';
 
 import { LinearAgentError } from '../src/errors.js';
 import { createPreparedWriteStore } from '../src/preparedWrites.js';
-import { createToolkit, type Toolkit } from '../src/toolkit.js';
+import { createToolkit, type Toolkit, type WriteMode } from '../src/toolkit.js';
 import {
+  CONVERSATION,
   createLog,
   createMockLinear,
+  createTurns,
   LABEL_MOBILE,
   makeComment,
   makeIssue,
@@ -18,6 +20,7 @@ import {
   USER_KIM_PARK,
   VIEWER,
   type MockLinear,
+  type Turns,
 } from './fixtures.js';
 
 // ---------------------------------------------------------------------------
@@ -27,16 +30,25 @@ import {
 function setup(
   options: Parameters<typeof createMockLinear>[0] = {},
   storeOptions: { now?: () => number; ttlMs?: number } = {},
-): { toolkit: Toolkit; mock: MockLinear; store: ReturnType<typeof createPreparedWriteStore> } {
+  writeMode: WriteMode = 'confirm',
+): {
+  toolkit: Toolkit;
+  mock: MockLinear;
+  store: ReturnType<typeof createPreparedWriteStore>;
+  turns: Turns;
+} {
   const mock = createMockLinear(options);
   const store = createPreparedWriteStore(storeOptions);
+  const turns = createTurns();
   const toolkit = createToolkit({
     client: mock.client,
     defaultTeamKey: 'oma', // lower case on purpose: the plugin normalises it
     log: createLog().log,
+    writeMode,
+    caller: turns.caller,
     store,
   });
-  return { toolkit, mock, store };
+  return { toolkit, mock, store, turns };
 }
 
 async function run(
@@ -63,10 +75,16 @@ async function rejects(
   });
 }
 
-/** Stage a write and return its token. */
+/** Stage a write; answers with the conversation it now waits in. */
 async function prepare(toolkit: Toolkit, input: unknown): Promise<string> {
-  const out = await run(toolkit, 'linear_prepare_write', input);
-  return out['token'] as string;
+  await run(toolkit, 'linear_prepare_write', input);
+  return CONVERSATION;
+}
+
+/** The user said yes: a new turn, and the commit made in it. */
+async function confirm(toolkit: Toolkit, turns: Turns): Promise<Record<string, unknown>> {
+  turns.next();
+  return run(toolkit, 'linear_commit_write', {});
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +166,7 @@ function requiredKeys(schema: unknown): string[] {
 describe('toolkit shape', () => {
   const { toolkit } = setup();
 
-  it('publishes exactly the five tools, with unique ids', () => {
+  it('publishes the three read tools and the two of the confirmation mode', () => {
     assert.deepEqual(
       toolkit.tools.map((t) => t.id),
       [
@@ -188,8 +206,18 @@ describe('toolkit shape', () => {
   it('takes an object at the top level, so the bridge sees properties at all', () => {
     for (const tool of toolkit.tools) {
       assert.equal(defOf(tool.input).type, 'object', `${tool.id} input must be an object`);
+      // The commit takes nothing: what it applies is decided by who calls.
+      if (tool.id === 'linear_commit_write') continue;
       assert.ok(collectTags(tool.input).size > 1, `${tool.id} input has no fields`);
     }
+  });
+
+  it('gives the commit no argument a model could aim at another change', () => {
+    const tool = toolkit.tools.find((t) => t.id === 'linear_commit_write');
+    assert.ok(tool);
+    assert.equal(collectTags(tool.input).size, 1);
+    assert.ok(tool.input.safeParse({}).success);
+    assert.equal(tool.input.safeParse({ token: 'w1-abcd' }).success, false);
   });
 
   it('asks only for what each tool genuinely needs', () => {
@@ -201,7 +229,7 @@ describe('toolkit shape', () => {
     // union, which the bridge cannot convert — so `kind` is the only hard
     // requirement here and validateWriteInput enforces the rest.
     assert.deepEqual(required.get('linear_prepare_write'), ['kind']);
-    assert.deepEqual(required.get('linear_commit_write'), ['token']);
+    assert.deepEqual(required.get('linear_commit_write'), []);
   });
 
   it('offers the five stages of work as an enum, and not triage', () => {
@@ -462,7 +490,8 @@ describe('linear_lookup', () => {
 
 describe('linear_prepare_write', () => {
   it('never reaches a mutating client method', async () => {
-    const { toolkit, mock } = setup({ states: [STATE_TODO, STATE_DONE] });
+    // One change per turn is the gate's rule, so each kind gets a turn.
+    const { toolkit, mock, turns } = setup({ states: [STATE_TODO, STATE_DONE] });
 
     await run(toolkit, 'linear_prepare_write', {
       kind: 'create_issue',
@@ -473,12 +502,14 @@ describe('linear_prepare_write', () => {
       labels: ['bug'],
       description: 'Details.',
     });
+    turns.next();
     await run(toolkit, 'linear_prepare_write', {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       stateName: 'Done',
       assignee: 'me',
     });
+    turns.next();
     await run(toolkit, 'linear_prepare_write', {
       kind: 'add_comment',
       issueKey: 'OMA-7',
@@ -492,48 +523,100 @@ describe('linear_prepare_write', () => {
     );
   });
 
-  it('returns a token, the preview, an expiry and the next step', async () => {
-    const { toolkit } = setup();
+  it('returns the preview and its expiry, and nothing else', async () => {
+    // The host can show this result to the user as a table, one column per
+    // key, while the model gets a digest in which every text is masked. A key
+    // holding an instruction would be on the user's screen and unread by the
+    // model, and a handle would be one more thing to carry back. So the
+    // result is the preview and until when it can be confirmed.
+    const clock = { now: () => Date.parse('2026-01-01T00:00:00.000Z') };
+    const { toolkit } = setup({}, clock);
     const out = await run(toolkit, 'linear_prepare_write', {
       kind: 'create_issue',
       title: 'Login fails on Safari',
       priority: 3,
     });
-    assert.match(out['token'] as string, /\S{8,}/);
-    assert.equal(out['preview'], 'New issue in OMA: Login fails on Safari (priority Medium)');
-    assert.ok(!Number.isNaN(Date.parse(out['expiresAt'] as string)));
-    assert.match(out['nextStep'] as string, /NOTHING HAS BEEN WRITTEN YET/);
-    assert.match(out['nextStep'] as string, /linear_commit_write/);
+    assert.deepEqual(out, {
+      preview: 'New issue in OMA: Login fails on Safari (priority Medium)',
+      expiresAt: '2026-01-01T00:10:00.000Z',
+    });
   });
 
-  it('tells the agent to hand the token back rather than commit in this turn', async () => {
-    // The sub-agent is called one stateless question at a time: `ask()` starts
-    // with a single user message, so a confirmation can only arrive in a LATER
-    // question, and only if the token travelled out in this answer. Without
-    // this instruction the write path dead-ends in repeated previews.
+  it('says in the tool description what happens next', () => {
+    // The sub-agent is called one stateless question at a time, so the
+    // confirmation arrives in a LATER question. The description is the place
+    // the model reads that, whatever the host does to the result.
     const { toolkit } = setup();
-    const out = await run(toolkit, 'linear_prepare_write', {
-      kind: 'add_comment',
-      issueKey: 'OMA-7',
-      body: 'note',
-    });
-    const next = out['nextStep'] as string;
-    assert.match(next, /NOTHING HAS BEEN WRITTEN YET/);
-    assert.match(next, /reply to your caller with the preview and this token/);
-    assert.match(next, /Do NOT call linear_commit_write in this turn/);
-    assert.match(next, /a later request/);
+    const tool = toolkit.tools.find((t) => t.id === 'linear_prepare_write');
+    assert.ok(tool);
+    assert.match(tool.description, /Nothing is written/);
+    assert.match(tool.description, /waits in this conversation, one at a time, for 10 minutes/);
+    assert.match(tool.description, /commit only when a later question says the user confirmed/);
+  });
+
+  it('stages the write for the calling conversation', async () => {
+    const { toolkit, store, turns } = setup();
+    await run(toolkit, 'linear_prepare_write', { kind: 'add_comment', issueKey: 'OMA-7', body: 'a' });
+
+    assert.equal(store.peek(CONVERSATION)?.write.kind, 'add_comment');
+
+    turns.switchTo('conversation-2');
+    await run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'b' });
+
+    assert.equal(store.peek(CONVERSATION)?.write.kind, 'add_comment');
+    assert.equal(store.peek('conversation-2')?.write.kind, 'create_issue');
+    assert.equal(store.size(), 2);
+  });
+
+  it('refuses a second change in the same turn, and keeps the first', async () => {
+    // Of two previews made in one turn nobody can say which the user saw, and
+    // the yes that follows would apply only one of them.
+    const { toolkit, store } = setup();
+    await run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'First' });
+
+    await rejects(
+      run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'Second' }),
+      /already waiting for the user's confirmation \('New issue in OMA: First'\).*One change per confirmation/s,
+    );
+    assert.equal(store.peek(CONVERSATION)?.preview, 'New issue in OMA: First');
+  });
+
+  it('lets a later turn replace a preview the user did not confirm', async () => {
+    const { toolkit, store, turns } = setup();
+    await run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'First' });
+
+    turns.next();
+    await run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'Changed' });
+
+    assert.equal(store.size(), 1);
+    assert.equal(store.peek(CONVERSATION)?.preview, 'New issue in OMA: Changed');
+  });
+
+  it('refuses where no conversation could bring the confirmation', async () => {
+    // A scheduled routine, a tool called by another plugin, a host without a
+    // turn context: a preview staged there would wait for a yes that cannot
+    // come. Refused before Linear is asked anything.
+    const { toolkit, store, turns, mock } = setup();
+    turns.leave();
+
+    await rejects(
+      run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'x' }),
+      /belongs to no conversation.*Nothing was written.*write mode/s,
+    );
+    assert.equal(store.size(), 0);
+    assert.deepEqual(mock.calls, []);
   });
 
   it('resolves names to ids before staging anything', async () => {
     const { toolkit, store } = setup({ states: [STATE_TODO, STATE_DONE] });
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'create_issue',
       title: 'New thing',
       stateName: 'todo',
       assignee: 'me',
       labels: ['mobile'],
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged);
     assert.equal(staged.write.kind, 'create_issue');
     assert.deepEqual(staged.write, {
@@ -552,12 +635,12 @@ describe('linear_prepare_write', () => {
 
   it('prefers an exact state name over a longer one that contains it', async () => {
     const { toolkit, store } = setup({ states: [STATE_TODO, STATE_DONE, STATE_DONE_DEPLOY] });
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       stateName: 'Done',
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged && staged.write.kind === 'update_issue');
     assert.equal(staged.write.patch.stateId, STATE_DONE.id);
   });
@@ -668,20 +751,20 @@ describe('linear_prepare_write', () => {
         issueKey: 'OMA-404',
         stateName: 'Done',
       }),
-      /No issue 'OMA-404'.*Nothing was staged/s,
+      /No issue 'OMA-404'.*Nothing was written/s,
     );
     assert.equal(store.size(), 0);
   });
 
   it('patches only the fields that differ, and says the rest is unchanged', async () => {
     const { toolkit, store } = setup({ states: [STATE_TODO, STATE_DONE] });
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       stateName: 'Done',
       assignee: 'me', // already the assignee
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged && staged.write.kind === 'update_issue');
     assert.deepEqual(staged.write.patch, { stateId: STATE_DONE.id });
     assert.equal(
@@ -707,12 +790,12 @@ describe('linear_prepare_write', () => {
 
   it('clears an assignee when asked for "none"', async () => {
     const { toolkit, store } = setup();
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       assignee: 'none',
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged && staged.write.kind === 'update_issue');
     assert.deepEqual(staged.write.patch, { assigneeId: null });
     assert.match(staged.preview, /assignee andre → nobody/);
@@ -732,12 +815,12 @@ describe('linear_prepare_write', () => {
 
   it('replaces the whole label set, since that is what the client does', async () => {
     const { toolkit, store } = setup();
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       labels: ['mobile'],
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged && staged.write.kind === 'update_issue');
     assert.deepEqual(staged.write.patch, { labelIds: [LABEL_MOBILE.id] });
     assert.match(staged.preview, /labels bug → mobile/);
@@ -745,12 +828,12 @@ describe('linear_prepare_write', () => {
 
   it('collapses a repeated label rather than sending it twice', async () => {
     const { toolkit, store } = setup({ issues: [makeIssue({ labels: [] })] });
-    const token = await prepare(toolkit, {
+    const conversation = await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       labels: ['bug', 'BUG'],
     });
-    const staged = store.peek(token);
+    const staged = store.peek(conversation);
     assert.ok(staged && staged.write.kind === 'update_issue');
     assert.deepEqual(staged.write.patch, { labelIds: ['label-bug'] });
     assert.match(staged.preview, /labels none → bug$/m);
@@ -775,8 +858,8 @@ describe('linear_prepare_write', () => {
 
 describe('linear_commit_write', () => {
   it('creates the issue exactly as staged, and reports its key and link', async () => {
-    const { toolkit, mock } = setup({ states: [STATE_TODO, STATE_DONE] });
-    const token = await prepare(toolkit, {
+    const { toolkit, mock, turns } = setup({ states: [STATE_TODO, STATE_DONE] });
+    await prepare(toolkit, {
       kind: 'create_issue',
       title: 'Login fails on Safari',
       description: 'Safari 17.',
@@ -786,7 +869,7 @@ describe('linear_commit_write', () => {
       labels: ['bug'],
     });
 
-    const out = await run(toolkit, 'linear_commit_write', { token });
+    const out = await confirm(toolkit, turns);
 
     assert.deepEqual(mock.callsTo('createIssue')[0]?.args[0], {
       teamId: TEAM_OMA.id,
@@ -803,8 +886,8 @@ describe('linear_commit_write', () => {
   });
 
   it('sends only the changed keys on an update', async () => {
-    const { toolkit, mock } = setup({ states: [STATE_TODO, STATE_DONE] });
-    const token = await prepare(toolkit, {
+    const { toolkit, mock, turns } = setup({ states: [STATE_TODO, STATE_DONE] });
+    await prepare(toolkit, {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       stateName: 'Done',
@@ -812,7 +895,7 @@ describe('linear_commit_write', () => {
       priority: 3,
     });
 
-    const out = await run(toolkit, 'linear_commit_write', { token });
+    const out = await confirm(toolkit, turns);
 
     const [call] = mock.callsTo('updateIssue');
     assert.equal(call?.args[0], 'issue-7');
@@ -822,73 +905,221 @@ describe('linear_commit_write', () => {
   });
 
   it('adds the comment to the resolved issue id', async () => {
-    const { toolkit, mock } = setup();
-    const token = await prepare(toolkit, {
+    const { toolkit, mock, turns } = setup();
+    await prepare(toolkit, {
       kind: 'add_comment',
       issueKey: 'oma-7',
       body: 'The fix is on staging.',
     });
 
-    const out = await run(toolkit, 'linear_commit_write', { token });
+    const out = await confirm(toolkit, turns);
 
     assert.deepEqual(mock.callsTo('addComment')[0]?.args, ['issue-7', 'The fix is on staging.']);
     assert.equal(out['key'], 'OMA-7');
     assert.equal(out['commentId'], 'comment-99');
   });
 
-  it('refuses a reused token and writes nothing the second time', async () => {
-    const { toolkit, mock } = setup();
-    const token = await prepare(toolkit, {
-      kind: 'add_comment',
-      issueKey: 'OMA-7',
-      body: 'once',
-    });
+  it('applies a prepared change once, and finds nothing the second time', async () => {
+    const { toolkit, mock, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'once' });
 
-    await run(toolkit, 'linear_commit_write', { token });
-    await rejects(run(toolkit, 'linear_commit_write', { token }), /already committed/);
+    await confirm(toolkit, turns);
+    await rejects(confirm(toolkit, turns), /No change is waiting.*already committed/s);
 
-    assert.equal(mock.mutations().length, 1, 'the same token must not apply twice');
+    assert.equal(mock.mutations().length, 1, 'the same change must not apply twice');
   });
 
-  it('refuses an expired token and writes nothing', async () => {
+  it('refuses in the turn that prepared, and keeps the change for the next one', async () => {
+    // The gate that used to live in the prompt alone: in the turn that
+    // produced the preview, nobody can have said yes to it.
+    const { toolkit, mock, store, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
+
+    await rejects(
+      run(toolkit, 'linear_commit_write', {}),
+      /prepared in this same turn.*Nothing was written.*a later question says the user confirmed/s,
+    );
+    assert.deepEqual(mock.mutations(), []);
+    assert.equal(store.size(), 1);
+
+    const out = await confirm(toolkit, turns);
+    assert.equal(out['committed'], true);
+    assert.equal(mock.mutations().length, 1);
+  });
+
+  it('does not apply a change prepared in another conversation', async () => {
+    const { toolkit, mock, store, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'mine' });
+
+    turns.switchTo('conversation-2');
+    await rejects(run(toolkit, 'linear_commit_write', {}), /No change is waiting/);
+
+    assert.deepEqual(mock.mutations(), []);
+    assert.equal(store.peek(CONVERSATION)?.write.kind, 'add_comment');
+  });
+
+  it('commits one change and prepares the next in the same turn', async () => {
+    // Several changes asked for at once are confirmed one after the other;
+    // the turn that commits the first may already prepare the second.
+    const { toolkit, mock, store, turns } = setup();
+    await prepare(toolkit, { kind: 'create_issue', title: 'First' });
+
+    await confirm(toolkit, turns);
+    await run(toolkit, 'linear_prepare_write', { kind: 'create_issue', title: 'Second' });
+
+    assert.equal(mock.mutations().length, 1);
+    assert.equal(store.peek(CONVERSATION)?.preview, 'New issue in OMA: Second');
+  });
+
+  it('refuses an expired change and writes nothing', async () => {
     let t = 1_000_000;
-    const { toolkit, mock } = setup({}, { now: () => t, ttlMs: 60_000 });
-    const token = await prepare(toolkit, {
-      kind: 'add_comment',
-      issueKey: 'OMA-7',
-      body: 'too late',
-    });
+    const { toolkit, mock, turns } = setup({}, { now: () => t, ttlMs: 60_000 });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'too late' });
 
     t += 60_001;
 
-    await rejects(run(toolkit, 'linear_commit_write', { token }), /expired.*Nothing was written/s);
+    await rejects(confirm(toolkit, turns), /expired.*Nothing was written/s);
     assert.deepEqual(mock.mutations(), []);
   });
 
-  it('refuses an unknown token and writes nothing', async () => {
+  it('refuses when nothing was prepared, and writes nothing', async () => {
     const { toolkit, mock } = setup();
     await rejects(
-      run(toolkit, 'linear_commit_write', { token: 'made-up-token' }),
-      /unknown, was already committed, or expired/,
+      run(toolkit, 'linear_commit_write', {}),
+      /No change is waiting for confirmation in this conversation/,
     );
+    assert.deepEqual(mock.mutations(), []);
+  });
+
+  it('refuses outside a conversation', async () => {
+    const { toolkit, mock, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
+    turns.leave();
+
+    await rejects(run(toolkit, 'linear_commit_write', {}), /belongs to no conversation/);
+    assert.deepEqual(mock.mutations(), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the other write modes
+// ---------------------------------------------------------------------------
+
+describe('write mode direct', () => {
+  it('offers one write tool in place of prepare and commit', () => {
+    const { toolkit } = setup({}, {}, 'direct');
+    assert.deepEqual(
+      toolkit.tools.map((t) => t.id),
+      ['linear_search_issues', 'linear_get_issue', 'linear_lookup', 'linear_write'],
+    );
+  });
+
+  it('tells the model that the change is applied at once', () => {
+    const { toolkit } = setup({}, {}, 'direct');
+    const tool = toolkit.tools.find((t) => t.id === 'linear_write');
+    assert.ok(tool);
+    assert.match(tool.description, /applies it AT ONCE; there is no preview and no undo/);
+    assert.match(tool.description, /ask in your answer instead of calling/);
+  });
+
+  it('takes the same input as a prepared write', () => {
+    const direct = setup({}, {}, 'direct').toolkit.tools.find((t) => t.id === 'linear_write');
+    const prepared = setup().toolkit.tools.find((t) => t.id === 'linear_prepare_write');
+    assert.ok(direct && prepared);
+    assert.deepEqual(
+      [...collectTags(direct.input)].sort(),
+      [...collectTags(prepared.input)].sort(),
+    );
+  });
+
+  it('creates an issue in one call, with every name resolved', async () => {
+    const { toolkit, mock, store } = setup({ states: [STATE_TODO, STATE_DONE] }, {}, 'direct');
+    const out = await run(toolkit, 'linear_write', {
+      kind: 'create_issue',
+      title: 'Login fails on Safari',
+      stateName: 'todo',
+      assignee: 'me',
+    });
+
+    assert.deepEqual(mock.callsTo('createIssue')[0]?.args[0], {
+      teamId: TEAM_OMA.id,
+      title: 'Login fails on Safari',
+      stateId: STATE_TODO.id,
+      assigneeId: VIEWER.id,
+    });
+    assert.equal(out['committed'], true);
+    assert.equal(out['key'], 'OMA-31');
+    assert.equal(store.size(), 0, 'a direct write stages nothing');
+  });
+
+  it('sends only the changed keys on an update', async () => {
+    const { toolkit, mock } = setup({ states: [STATE_TODO, STATE_DONE] }, {}, 'direct');
+    await run(toolkit, 'linear_write', {
+      kind: 'update_issue',
+      issueKey: 'OMA-7',
+      stateName: 'Done',
+      assignee: 'me',
+    });
+
+    const [call] = mock.callsTo('updateIssue');
+    assert.equal(call?.args[0], 'issue-7');
+    assert.deepEqual(call?.args[1], { stateId: STATE_DONE.id });
+  });
+
+  it('needs no conversation: a routine may write', async () => {
+    const { toolkit, mock, turns } = setup({}, {}, 'direct');
+    turns.leave();
+
+    await run(toolkit, 'linear_write', { kind: 'add_comment', issueKey: 'OMA-7', body: 'nightly' });
+
+    assert.deepEqual(mock.callsTo('addComment')[0]?.args, ['issue-7', 'nightly']);
+  });
+
+  it('refuses what a prepared write refuses, and writes nothing', async () => {
+    const { toolkit, mock } = setup({}, {}, 'direct');
+    await rejects(
+      run(toolkit, 'linear_write', { kind: 'update_issue', issueKey: 'OMA-7', stateName: 'Shipped' }),
+      /no workflow state matching 'Shipped'/,
+    );
+    await rejects(
+      run(toolkit, 'linear_write', { kind: 'add_comment', issueKey: 'OMA-7', title: 'x', body: 'y' }),
+      /add_comment does not take title/,
+    );
+    await rejects(
+      run(toolkit, 'linear_write', { kind: 'update_issue', issueKey: 'OMA-404', priority: 1 }),
+      /No issue 'OMA-404'.*Nothing was written/s,
+    );
+    assert.deepEqual(mock.mutations(), []);
+  });
+});
+
+describe('write mode off', () => {
+  it('offers the three read tools and no way to write', () => {
+    const { toolkit } = setup({}, {}, 'off');
+    assert.deepEqual(
+      toolkit.tools.map((t) => t.id),
+      ['linear_search_issues', 'linear_get_issue', 'linear_lookup'],
+    );
+  });
+
+  it('still reads', async () => {
+    const { toolkit, mock } = setup({}, {}, 'off');
+    const out = await run(toolkit, 'linear_get_issue', { key: 'OMA-7' });
+    assert.equal(out['key'], 'OMA-7');
     assert.deepEqual(mock.mutations(), []);
   });
 });
 
 describe('toolkit close', () => {
   it('drops staged writes, so a preview cannot be committed after a deactivate', async () => {
-    const { toolkit, store, mock } = setup();
-    const token = await prepare(toolkit, {
-      kind: 'add_comment',
-      issueKey: 'OMA-7',
-      body: 'note',
-    });
+    const { toolkit, store, mock, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
     assert.equal(store.size(), 1);
 
     await toolkit.close();
 
     assert.equal(store.size(), 0);
-    await rejects(run(toolkit, 'linear_commit_write', { token }), /unknown/);
+    await rejects(confirm(toolkit, turns), /No change is waiting/);
     assert.deepEqual(mock.mutations(), []);
   });
 });

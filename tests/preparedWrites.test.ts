@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
+import type { Caller } from '../src/caller.js';
 import { LinearAgentError } from '../src/errors.js';
 import {
   createPreparedWriteStore,
@@ -10,9 +11,11 @@ import {
 } from '../src/preparedWrites.js';
 
 /**
- * The store is the write gate. Its three promises are that a staged write is
- * inert, that a token applies once, and that a token dies of old age — so those
- * are what is tested, with an injected clock rather than a sleeping test.
+ * The store is the write gate of the confirmation mode. Its promises are that
+ * a staged write is inert, that it belongs to one conversation, that it cannot
+ * be committed in the turn that staged it, that it applies once, and that it
+ * dies of old age. Those are what is tested, with an injected clock rather
+ * than a sleeping test.
  */
 
 const WRITE: PreparedWrite = {
@@ -23,22 +26,36 @@ const WRITE: PreparedWrite = {
   body: 'On staging now.',
 };
 
+const TURN_1: Caller = { conversation: 'a', turn: 'turn-1' };
+const TURN_2: Caller = { conversation: 'a', turn: 'turn-2' };
+const ELSEWHERE: Caller = { conversation: 'b', turn: 'turn-9' };
+
 function fixedClock(start = 1_000_000): { now: () => number; advance: (ms: number) => void } {
   let t = start;
   return { now: () => t, advance: (ms: number) => void (t += ms) };
 }
 
+function refuses(run: () => unknown, pattern: RegExp): void {
+  assert.throws(run, (err: unknown) => {
+    assert.ok(err instanceof PreparedWriteError);
+    assert.match(err.message, pattern);
+    return true;
+  });
+}
+
 describe('createPreparedWriteStore', () => {
-  it('stages a write and hands back a token, a preview and an expiry', () => {
+  it('stages a write with its preview, its expiry and the turn it came from', () => {
     const clock = fixedClock();
     const store = createPreparedWriteStore({ now: clock.now });
 
-    const entry = store.stage(WRITE, 'the preview');
+    const entry = store.stage(TURN_1, WRITE, 'the preview');
 
-    assert.ok(entry.token.length >= 8, 'token should be long enough to be unguessable');
-    assert.equal(entry.preview, 'the preview');
-    assert.equal(entry.expiresAt, clock.now() + PREPARED_WRITE_TTL_MS);
-    assert.deepEqual(entry.write, WRITE);
+    assert.deepEqual(entry, {
+      write: WRITE,
+      preview: 'the preview',
+      expiresAt: clock.now() + PREPARED_WRITE_TTL_MS,
+      preparedInTurn: 'turn-1',
+    });
     assert.equal(store.size(), 1);
   });
 
@@ -46,117 +63,160 @@ describe('createPreparedWriteStore', () => {
     assert.equal(PREPARED_WRITE_TTL_MS, 10 * 60 * 1000);
   });
 
-  it('gives every staged write its own token', () => {
+  it('keeps one write per conversation', () => {
     const store = createPreparedWriteStore();
-    const a = store.stage(WRITE, 'a');
-    const b = store.stage(WRITE, 'b');
-    assert.notEqual(a.token, b.token);
+    store.stage(TURN_1, WRITE, 'a');
+    store.stage(ELSEWHERE, WRITE, 'b');
+
     assert.equal(store.size(), 2);
+    assert.equal(store.peek('a')?.preview, 'a');
+    assert.equal(store.peek('b')?.preview, 'b');
   });
 
-  it('returns the staged entry on take', () => {
+  it('refuses a second write in the same turn and keeps the first', () => {
     const store = createPreparedWriteStore();
-    const entry = store.stage(WRITE, 'the preview');
-    const taken = store.take(entry.token);
-    assert.equal(taken.token, entry.token);
-    assert.deepEqual(taken.write, WRITE);
-  });
+    store.stage(TURN_1, WRITE, 'OMA-7: Todo → Done');
 
-  it('lets a token be taken exactly once', () => {
-    const store = createPreparedWriteStore();
-    const { token } = store.stage(WRITE, 'the preview');
-
-    store.take(token);
-
-    assert.throws(
-      () => store.take(token),
-      (err: unknown) => {
-        assert.ok(err instanceof PreparedWriteError);
-        assert.match(err.message, /already committed/);
-        return true;
-      },
+    refuses(
+      () => store.stage(TURN_1, WRITE, 'another'),
+      /already waiting for the user's confirmation \('OMA-7: Todo → Done'\).*Nothing new was prepared/s,
     );
+    assert.equal(store.peek('a')?.preview, 'OMA-7: Todo → Done');
+  });
+
+  it('lets a later turn replace the write that was waiting', () => {
+    const store = createPreparedWriteStore();
+    store.stage(TURN_1, WRITE, 'declined');
+    store.stage(TURN_2, WRITE, 'changed');
+
+    assert.equal(store.size(), 1);
+    assert.equal(store.peek('a')?.preview, 'changed');
+    assert.equal(store.peek('a')?.preparedInTurn, 'turn-2');
+  });
+
+  it('returns the staged entry to a later turn of the same conversation', () => {
+    const store = createPreparedWriteStore();
+    const entry = store.stage(TURN_1, WRITE, 'the preview');
+
+    assert.deepEqual(store.take(TURN_2), entry);
     assert.equal(store.size(), 0);
   });
 
-  it('rejects an unknown token with a message that says what to do', () => {
+  it('refuses the turn that staged the write, and keeps it for the next', () => {
     const store = createPreparedWriteStore();
-    assert.throws(
-      () => store.take('not-a-token'),
-      (err: unknown) => {
-        assert.ok(err instanceof PreparedWriteError);
-        assert.match(err.message, /unknown/);
-        assert.match(err.message, /linear_prepare_write/);
-        assert.match(err.message, /after the user confirms/);
-        return true;
-      },
+    store.stage(TURN_1, WRITE, 'the preview');
+
+    refuses(() => store.take(TURN_1), /prepared in this same turn.*Nothing was written/s);
+    assert.equal(store.size(), 1);
+    assert.equal(store.take(TURN_2).preview, 'the preview');
+  });
+
+  it('answers another conversation as if nothing were staged', () => {
+    const store = createPreparedWriteStore();
+    store.stage(TURN_1, WRITE, 'the preview');
+
+    refuses(() => store.take(ELSEWHERE), /No change is waiting for confirmation/);
+    assert.equal(store.size(), 1);
+  });
+
+  it('lets a write be taken exactly once', () => {
+    const store = createPreparedWriteStore();
+    store.stage(TURN_1, WRITE, 'the preview');
+
+    store.take(TURN_2);
+
+    refuses(() => store.take(TURN_2), /already committed/);
+    assert.equal(store.size(), 0);
+  });
+
+  it('says what to do when nothing is staged', () => {
+    const store = createPreparedWriteStore();
+    refuses(
+      () => store.take(TURN_1),
+      /No change is waiting.*linear_prepare_write.*after the user confirms/s,
     );
   });
 
-  it('rejects a token past its TTL and names the age', () => {
+  it('rejects a write past its TTL and names the age', () => {
     const clock = fixedClock();
     const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
-    const { token } = store.stage(WRITE, 'the preview');
+    store.stage(TURN_1, WRITE, 'the preview');
 
     clock.advance(60_000);
 
-    assert.throws(
-      () => store.take(token),
-      (err: unknown) => {
-        assert.ok(err instanceof PreparedWriteError);
-        assert.match(err.message, /expired/);
-        assert.match(err.message, /Nothing was written/);
-        return true;
-      },
-    );
+    refuses(() => store.take(TURN_2), /expired less than a minute ago.*Nothing was written/s);
+    assert.equal(store.size(), 0);
   });
 
-  it('accepts a token right up to its expiry', () => {
+  it('reports expiry before the same-turn rule, since an expired write is gone either way', () => {
     const clock = fixedClock();
     const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
-    const { token } = store.stage(WRITE, 'the preview');
+    store.stage(TURN_1, WRITE, 'the preview');
+
+    clock.advance(180_000);
+
+    refuses(() => store.take(TURN_1), /expired 2 minute\(s\) ago/);
+  });
+
+  it('accepts a write right up to its expiry', () => {
+    const clock = fixedClock();
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    store.stage(TURN_1, WRITE, 'the preview');
 
     clock.advance(59_999);
 
-    assert.equal(store.take(token).token, token);
+    assert.equal(store.take(TURN_2).preview, 'the preview');
   });
 
-  it('is a LinearAgentError, so a tool can report it as an instruction problem', () => {
+  it('lets an expired write be replaced in the turn that staged it', () => {
+    // The same-turn refusal protects a preview somebody may still confirm. An
+    // expired one protects nothing.
+    const clock = fixedClock();
+    const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
+    store.stage(TURN_1, WRITE, 'old');
+
+    clock.advance(60_001);
+    store.stage(TURN_1, WRITE, 'new');
+
+    assert.equal(store.peek('a')?.preview, 'new');
+  });
+
+  it('is a LinearAgentError, so a tool reports it as a refusal', () => {
     const store = createPreparedWriteStore();
-    assert.throws(() => store.take('nope'), LinearAgentError);
+    assert.throws(() => store.take(TURN_1), LinearAgentError);
   });
 
   it('does not report an expired entry through peek', () => {
     const clock = fixedClock();
     const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
-    const { token } = store.stage(WRITE, 'the preview');
+    store.stage(TURN_1, WRITE, 'the preview');
 
-    assert.ok(store.peek(token));
+    assert.ok(store.peek('a'));
     clock.advance(60_001);
-    assert.equal(store.peek(token), undefined);
+    assert.equal(store.peek('a'), undefined);
   });
 
   it('sweeps expired entries and leaves live ones', () => {
     const clock = fixedClock();
     const store = createPreparedWriteStore({ now: clock.now, ttlMs: 60_000 });
-    store.stage(WRITE, 'old');
+    store.stage(TURN_1, WRITE, 'old');
 
     clock.advance(30_000);
-    const fresh = store.stage(WRITE, 'fresh');
+    store.stage(ELSEWHERE, WRITE, 'fresh');
     clock.advance(30_001);
 
     assert.equal(store.sweep(), 1);
     assert.equal(store.size(), 1);
-    assert.ok(store.peek(fresh.token));
+    assert.equal(store.peek('b')?.preview, 'fresh');
   });
 
   it('drops everything on clear, so nothing outlives a deactivate', () => {
     const store = createPreparedWriteStore();
-    const { token } = store.stage(WRITE, 'the preview');
+    store.stage(TURN_1, WRITE, 'the preview');
 
     store.clear();
 
     assert.equal(store.size(), 0);
-    assert.throws(() => store.take(token), PreparedWriteError);
+    refuses(() => store.take(TURN_2), /No change is waiting/);
   });
 });

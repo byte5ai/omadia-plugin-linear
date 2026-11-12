@@ -1,7 +1,8 @@
 import type { LinearClient } from '@omadia/integration-linear';
 import type { PluginContext } from '@omadia/plugin-api';
 
-import { createToolkit, type Toolkit } from './toolkit.js';
+import { createCallerReader, type TurnContextService } from './caller.js';
+import { createToolkit, isWriteMode, type Toolkit, type WriteMode } from './toolkit.js';
 
 /**
  * `@omadia/agent-linear` — the Linear agent.
@@ -17,8 +18,16 @@ import { createToolkit, type Toolkit } from './toolkit.js';
  * secret resolves along the `depends_on` chain, and a redeclared field silently
  * overrides the parent's value with an empty one.
  *
- * Its one setup field is `default_team_key`, the team used whenever a tool call
- * omits `teamKey`.
+ * It has two setup fields: `default_team_key`, the team used whenever a tool
+ * call omits `teamKey`, and `linear_write_mode`, which decides whether a change
+ * waits for the user's confirmation, is applied at once, or is not offered at
+ * all. The mode is read here, once: the host reactivates a plugin when its
+ * settings change, and the toolkit is built with the write tools of that mode.
+ *
+ * A third declaration is optional: `optional_requires: ["turnContext@1"]`. The
+ * confirmation mode asks that host service which conversation and which turn a
+ * call belongs to. A host without it still activates this plugin; a change
+ * that needs confirming is then refused with a sentence that says why.
  *
  * Lifecycle budgets: `activate()` has 10 s, `close()` has 5 s. Activation makes
  * no network call at all: whether the key works is the Linear connection's
@@ -39,8 +48,19 @@ export const AGENT_ID = '@omadia/agent-linear' as const;
  *  and `provides:` in the connection's manifest. */
 export const LINEAR_API_SERVICE_NAME = 'linear.api';
 
-/** The one setup field. Must match `setup.fields[0].key` in manifest.yaml. */
+/** Setup field. Must match `setup.fields[0].key` in manifest.yaml. */
 export const DEFAULT_TEAM_KEY_FIELD = 'default_team_key';
+
+/** Setup field. Must match `setup.fields[1].key` in manifest.yaml. */
+export const WRITE_MODE_FIELD = 'linear_write_mode';
+
+/** The mode of an install that never saw the field, and of a value this
+ *  version does not know: the one in which nothing is written unasked. */
+export const DEFAULT_WRITE_MODE: WriteMode = 'confirm';
+
+/** The host service the confirmation mode reads the caller from. Must match
+ *  `optional_requires:` in manifest.yaml. */
+export const TURN_CONTEXT_SERVICE_NAME = 'turnContext';
 
 export interface LinearAgentHandle {
   readonly toolkit: Toolkit;
@@ -60,17 +80,27 @@ export async function activate(ctx: PluginContext): Promise<LinearAgentHandle> {
   }
 
   const defaultTeamKey = readDefaultTeamKey(ctx);
+  const writeMode = readWriteMode(ctx);
+  const turnContext = readTurnContext(ctx);
+  if (writeMode === 'confirm' && turnContext === undefined) {
+    ctx.log(
+      `service '${TURN_CONTEXT_SERVICE_NAME}' is not available on this host: a change cannot be bound to ` +
+        'its conversation, so every change that needs confirming will be refused',
+    );
+  }
 
   const toolkit = createToolkit({
     client,
     defaultTeamKey,
+    writeMode,
+    caller: createCallerReader(turnContext),
     log: (...args: unknown[]) => {
       ctx.log(...args);
     },
   });
 
   ctx.log(
-    `linear agent ready (default team ${defaultTeamKey}, tools: ${toolkit.tools
+    `linear agent ready (default team ${defaultTeamKey}, write mode ${writeMode}, tools: ${toolkit.tools
       .map((t) => t.id)
       .join(', ')})`,
   );
@@ -107,4 +137,33 @@ function readDefaultTeamKey(ctx: PluginContext): string {
     );
   }
   return value;
+}
+
+/**
+ * The write mode the operator chose. An unset field is an install from before
+ * the field existed, an unknown value a setting from another version; both
+ * get the default rather than an activation failure, and the log says so.
+ */
+function readWriteMode(ctx: PluginContext): WriteMode {
+  const raw = ctx.config.get<unknown>(WRITE_MODE_FIELD);
+  if (isWriteMode(raw)) return raw;
+  if (raw !== undefined && raw !== '') {
+    ctx.log(
+      `'${WRITE_MODE_FIELD}' has the unknown value '${String(raw)}', using '${DEFAULT_WRITE_MODE}'`,
+    );
+  }
+  return DEFAULT_WRITE_MODE;
+}
+
+/**
+ * The host's turn context, or `undefined` on a host that does not grant it.
+ * Asking for a service the host does not know can throw there, and a missing
+ * turn context must cost the confirmation mode, not the activation.
+ */
+function readTurnContext(ctx: PluginContext): TurnContextService | undefined {
+  try {
+    return ctx.services.get<TurnContextService>(TURN_CONTEXT_SERVICE_NAME);
+  } catch {
+    return undefined;
+  }
 }

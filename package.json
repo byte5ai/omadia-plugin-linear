@@ -1,6 +1,6 @@
 {
   "name": "@omadia/agent-linear",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "dist/plugin.js",
@@ -11,7 +11,7 @@
       "default": "./dist/plugin.js"
     }
   },
-  "description": "Linear agent for the Omadia harness — five tools over the Linear API capability published by @omadia/integration-linear, with every write staged as a prepared write and applied only after the user confirms the preview.",
+  "description": "Linear agent for the Omadia harness — reads Linear issues and creates, changes or comments on them over the Linear API capability published by @omadia/integration-linear. By default every write is staged as a prepared write and applied only after the user confirms the preview.",
   "license": "MIT",
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -22,7 +22,6 @@
   },
   "peerDependencies": {
     "@omadia/plugin-api": "*",
-    "@omadia/integration-linear": "*",
     "zod": "^4.0.0"
   },
   "devDependencies": {

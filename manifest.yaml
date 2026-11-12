@@ -22,12 +22,12 @@ identity:
   # `query_linear`. The domain is the bucket the tool is filed under.
   domain: "linear"
   name: "Linear"
-  version: "0.1.1" # === package.json "version"
+  version: "0.3.0" # === package.json "version"
   # Locale map, not a bare string (#885): a bare string is read as English, so
   # German in this slot would surface as the English description in the Hub.
   description:
-    en: "Works with Linear issues from any channel: searches and reads them, and creates, changes or comments on them after showing you a preview and getting your explicit go-ahead."
-    de: "Arbeitet aus jedem Kanal mit Linear-Aufgaben: sucht und liest sie und legt sie an, ändert sie oder kommentiert sie, nachdem eine Vorschau gezeigt und ausdrücklich bestätigt wurde."
+    en: "Works with Linear issues from any channel: searches and reads them, and creates, changes or comments on them. By default every change is shown as a preview first and applied only after your explicit go-ahead."
+    de: "Arbeitet aus jedem Kanal mit Linear-Aufgaben: sucht und liest sie, legt sie an, ändert und kommentiert sie. In der Voreinstellung wird jede Änderung erst als Vorschau gezeigt und nur nach ausdrücklicher Bestätigung übernommen."
   authors:
     - name: "byte5 GmbH"
       email: "info@omadia.ai"
@@ -41,11 +41,10 @@ compat:
   core: ">=1.0 <2.0"
   node: ">=20"
 
-# Safe to activate for more than one Agent. Note what that does NOT buy: the
-# kernel keeps a single activation per plugin id, so the prepared-write store in
-# src/preparedWrites.ts is process-wide, not per orchestrator and not per
-# conversation. A token's only bounds are that it is unguessable, single-use and
-# ten minutes old — not that it belongs to the conversation it was previewed in.
+# Safe to activate for more than one Agent. The kernel keeps a single
+# activation per plugin id, so the prepared-write store in src/preparedWrites.ts
+# is one per process; what keeps two conversations apart is its key: the agent,
+# the user and the session of the call, read from the host's turn context.
 multi_instance: true
 privacy_class: "strict"
 
@@ -61,6 +60,18 @@ depends_on:
 # major-only; the caret is accepted and documents the intent.
 requires:
   - "linear.api@^1"
+
+# The host's turn context: which conversation and which turn a tool call
+# belongs to. The confirmation mode binds a prepared change to its conversation
+# with it, so the user's "yes" finds the change without a handle travelling
+# through the answer, and refuses a commit in the turn that prepared.
+# Optional, not required: the host publishes the service itself, no plugin
+# provides it, and a host without it must still be able to activate this agent
+# for reading and for direct writes. `optional_requires:` is what grants
+# `ctx.services.get('turnContext')` without making it an activation
+# prerequisite.
+optional_requires:
+  - "turnContext@1"
 
 lifecycle:
   entry: "dist/plugin.js" # exports `activate(ctx)` -> { toolkit, close }
@@ -88,6 +99,34 @@ setup:
       pattern_hint:
         en: "Two to ten letters or digits, e.g. OMA."
         de: "Zwei bis zehn Buchstaben oder Ziffern, z. B. OMA."
+    # How a change reaches Linear. One field for three states, because they
+    # exclude each other: with two switches, "writes off, confirmation on"
+    # would be a setting that means nothing. The value decides which write
+    # tools the model is offered (src/toolkit.ts); it is read at activation,
+    # and the host reactivates the plugin when a setting changes.
+    - key: "linear_write_mode"
+      type: "enum"
+      required: false
+      default: "confirm"
+      label:
+        en: "Changes to Linear"
+        de: "Änderungen in Linear"
+      help:
+        en: "With confirmation: every change is shown as a preview and applied only after the user says yes in the conversation. Without confirmation: a change is applied as soon as it is asked for; there is no preview and no undo. Off: the agent only reads. A read-only Linear API key passes the connection check either way, so choose Off for such a key; otherwise every change fails at Linear."
+        de: "Mit Bestätigung: Jede Änderung wird als Vorschau gezeigt und erst übernommen, wenn der Nutzer in der Unterhaltung zustimmt. Ohne Bestätigung: Eine Änderung wird sofort übernommen, ohne Vorschau und ohne Rückgängig. Aus: Der Agent liest nur. Ein Linear-API-Schlüssel mit reinem Lesezugriff besteht die Verbindungsprüfung in jedem Fall; wählen Sie für einen solchen Schlüssel »Aus«, sonst scheitert jede Änderung erst bei Linear."
+      enum:
+        - value: "confirm"
+          label:
+            en: "With confirmation (recommended)"
+            de: "Mit Bestätigung (empfohlen)"
+        - value: "direct"
+          label:
+            en: "Without confirmation"
+            de: "Ohne Bestätigung"
+        - value: "off"
+          label:
+            en: "Off (read only)"
+            de: "Aus (nur lesen)"
   # `self_test: true` obliges a plugin to ship an `onConfigure` hook, and core
   # does not call one. Whether the API key works is answered by the Linear
   # connection's own connection check and shown in the Store; this plugin
@@ -107,13 +146,23 @@ llm:
   fallback_allowed: true
 
 playbook:
+  # Read by two models. The orchestrator gets it as the description of the
+  # `query_linear` tool, the Linear agent as the head of its system prompt. It
+  # is the only text of this package the orchestrator reads before it calls,
+  # so the caller's half of the write rule has to stand here, in the third
+  # person so that both readers take it the same way.
   when_to_use: >
     Anything to do with Linear issues: what is assigned to someone, what is in
     progress or already done, what an issue says and who commented on it, plus
     creating an issue, changing its state, assignee, priority, title,
-    description or labels, and adding a comment. Every change is shown as a
-    preview first and applied only after the user confirms it in the same
-    conversation.
+    description or labels, and adding a comment. How a change is applied is
+    the operator's setting, and the agent's answer says which of the two
+    happened. Either the change is applied at once. Or it is only prepared:
+    nothing is written yet, and the calling agent shows the user the preview
+    and asks. When the user has confirmed, in a later turn, the calling agent
+    asks this agent again and says that the user confirmed; the prepared change
+    is then applied. One change waits per conversation, for ten minutes. If
+    changes are switched off, the agent says so.
   combines_with: []
   not_for:
     - "Issue trackers other than Linear (GitHub Issues, Jira)"
@@ -139,14 +188,14 @@ skills:
   - id: "linear-expert"
     kind: "prompt_partial"
     path: "skills/linear-expert.md"
-    description: "How the Linear agent is called, its vocabulary, the prepare/preview/commit rule every write has to follow, and how to read a tool error."
+    description: "How the Linear agent is called, how a tool result reaches it, its vocabulary, how a change is made in each write mode, and how to read a tool error."
     shareable: false
 
 permissions:
   # No memory accessor: the agent keeps nothing between turns. The one piece of
   # state it holds — the prepared-write store — is in-memory by design, because
-  # a token that survived a restart would outlive every conversation that could
-  # have confirmed it.
+  # a prepared change that survived a restart would outlive the moment its
+  # preview was read in.
   memory:
     reads: []
     writes: []

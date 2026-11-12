@@ -2,8 +2,9 @@
 
 The **Linear agent**: the Omadia plugin that carries the Linear tools and their
 prompt. From any channel it can search and read Linear issues, and create,
-change or comment on them — with every change shown as a preview first and
-applied only after the user confirms it.
+change or comment on them. By default every change is shown as a preview first
+and applied only after the user confirms it; the operator can switch the
+confirmation off, or switch changes off altogether.
 
 It holds no credential. Linear is reached through the **Linear API capability**
 (`linear.api@1`) published by [`@omadia/integration-linear`](../omadia-integration-linear),
@@ -13,7 +14,7 @@ anything here.
 
 ```
 @omadia/integration-linear          @omadia/agent-linear
-  linear_api_key (secret)             default_team_key (string)
+  linear_api_key (secret)             default_team_key, linear_write_mode
   provides: linear.api@1      <────   requires: linear.api@^1
   egress: api.linear.app              egress: none
 ```
@@ -27,19 +28,31 @@ anything here.
    `POST /api/v1/install/plugins/:id` followed by `/configure`.)
 3. Enter the **default team key** — the prefix of that team's issue keys, so
    `OMA` for `OMA-7`. It is the team used whenever a request does not name one.
+4. Choose how **changes to Linear** are made (`linear_write_mode`):
+
+   | Value | What the agent does |
+   |---|---|
+   | `confirm` (default) | Shows every change as a preview and applies it only after the user says yes in the conversation. |
+   | `direct` | Applies a change as soon as it is asked for. No preview, no undo. |
+   | `off` | Reads only. The write tools are not offered to the model at all. |
+
+   A Linear API key restricted to reading passes the connection check all the
+   same, because that check only reads. With such a key choose `off`:
+   otherwise the agent offers changes that all fail at Linear.
 
 The orchestrator reaches this agent as the tool `query_linear`, derived from the
-plugin id. The five tools below are the sub-agent's, not the orchestrator's.
+plugin id. The tools below are the sub-agent's, not the orchestrator's.
 
-## The five tools
+## The tools
 
-| Tool | What it does |
-|---|---|
-| `linear_search_issues` | Issues by team, stage of work, assignee or free text. Returns one compact summary per issue. |
-| `linear_get_issue` | One issue by key, with its description and most recent comments. |
-| `linear_lookup` | Teams, workflow states, workspace members or labels — the records a write refers to by name. |
-| `linear_prepare_write` | Validates and stages a change, returns a token plus a preview. **Writes nothing.** |
-| `linear_commit_write` | Applies one staged change. The only code path that mutates Linear. |
+| Tool | Write mode | What it does |
+|---|---|---|
+| `linear_search_issues` | all | Issues by team, stage of work, assignee or free text. Returns one compact summary per issue. |
+| `linear_get_issue` | all | One issue by key, with its description and most recent comments. |
+| `linear_lookup` | all | Teams, workflow states, workspace members or labels — the records a write refers to by name. |
+| `linear_prepare_write` | `confirm` | Validates and stages a change, returns a preview and its expiry. **Writes nothing.** |
+| `linear_commit_write` | `confirm` | Applies the change staged in the calling conversation. |
+| `linear_write` | `direct` | Validates a change and applies it at once. |
 
 Editable: state, assignee, priority, title, description, labels. Not editable:
 project, cycle, estimate, parent. There is no delete and no archive; "closing"
@@ -47,57 +60,101 @@ an issue is a move to a state whose type is `completed` or `canceled`.
 
 ## The write gate
 
-Core does not enforce a two-phase confirm for any tool kind, so the gate lives
-in this plugin — and it has to work across two orchestrator turns, because the
-sub-agent this toolkit runs in is stateless. `LocalSubAgent.ask()` starts each
-call with a single user message, so a confirmation cannot reach the agent on its
-own: the token has to travel out in the agent's answer and come back in the next
-question. That is what the `nextStep` field of `linear_prepare_write` and the
-"How you are called" section of the prompt partial are for.
+Core does not enforce a two-phase confirm for any tool kind, so in the
+`confirm` mode the gate lives in this plugin. It spans two turns of the
+conversation: one that shows the preview, one that brings the user's yes.
 
 1. `linear_prepare_write` resolves every name to a Linear record, validates the
-   change, renders a preview and stages it under a token. Nothing in Linear
-   changes.
-2. The agent ends its turn, returning the preview and the token verbatim to the
-   orchestrator, which shows them to the user and asks.
-3. The next question carries the token plus the user's yes.
-   `linear_commit_write` takes the token — removing it from the store first —
-   and applies exactly that staged change.
+   change, renders a preview and stages it for the calling conversation.
+   Nothing in Linear changes. The result is `{ preview, expiresAt }`.
+2. The Linear agent ends its turn. The orchestrator shows the user the preview
+   and asks.
+3. The user confirms. The orchestrator asks the Linear agent again and says
+   so. `linear_commit_write` takes no input: it applies the change staged for
+   the calling conversation, removing it from the store first.
 
-Properties this buys, and where they are enforced:
+### Who is calling
 
-- **A staged write is inert.** `src/preparedWrites.ts` holds descriptors, not
-  requests. A test asserts that a full round of prepare calls reaches none of
+A tool gets its input and nothing else as an argument, and the Linear agent is
+stateless: `LocalSubAgent.ask()` starts each call with a single user message.
+What connects step 3 to step 1 is the host's **turn context**, a service
+published as the capability `turnContext@1` (`optional_requires:` in the
+manifest, read in `src/caller.ts`). For the call in flight it names the agent,
+the user, the session and the turn. The first three together are the
+conversation a prepared write is staged under; the turn is what tells a commit
+made after the user answered from one made before.
+
+That is why no handle travels with the conversation. An earlier version
+returned a token that the Linear agent had to hand to the orchestrator, the
+orchestrator had to write into its answer, and the next turn had to bring back
+— past a privacy filter that masks strings in tool results, and across a turn
+boundary that keeps only the answer text. Every station could lose it.
+
+Properties this buys, and where they are enforced (`src/preparedWrites.ts`):
+
+- **A staged write is inert.** The store holds descriptors, not requests. A
+  test asserts that a full round of prepare calls reaches none of
   `createIssue`, `updateIssue` or `addComment`.
-- **A token applies once.** `take()` deletes before it returns, so a retried or
+- **It belongs to its conversation.** A commit from another conversation,
+  another user or another agent finds nothing.
+- **Not in the turn that prepared.** `take()` refuses a commit whose turn is
+  the one that staged the write, and leaves the write where it is. The prompt
+  says the same, but this half no longer depends on the model following it.
+- **One per conversation.** A second prepare in the same turn is refused: of
+  two previews made in one turn, nobody could say which one the user saw. A
+  prepare in a later turn replaces the earlier one. Several changes asked for
+  at once are therefore confirmed one after the other; for bulk work the
+  `direct` mode is the tool.
+- **It applies once.** `take()` deletes before it returns, so a retried or
   racing commit cannot double-apply. The cost: a commit that fails upstream
   needs a fresh preview.
-- **A token expires after ten minutes.** A preview describes the issue as it was
-  when the preview was rendered; past that, the token dies rather than applying
-  a change the user agreed to against a different state of the world.
+- **It expires after ten minutes.** A preview describes the issue as it was
+  when the preview was rendered; past that, the write dies rather than
+  applying a change the user agreed to against a different state of the world.
 - **Nothing survives a restart or a deactivate.** The store is in-memory and
   `close()` clears it.
 
-What the store deliberately does **not** promise: conversation scope. The kernel
-keeps one activation per plugin id, so a single store serves every orchestrator
-in the process. A token is unguessable, single-use and short-lived, but it is
-not bound to the conversation that produced it.
+What the gate does **not** decide is whether the user said yes. That is the
+orchestrator's reading of the user's message, and the Linear agent's reading
+of the orchestrator's question. `playbook.when_to_use` in the manifest carries
+the orchestrator's half of the rule — it becomes the description of
+`query_linear`, the one text of this package the orchestrator reads before it
+calls — and `skills/linear-expert.md` carries the agent's half.
 
-The prompt half of the same rule is `skills/linear-expert.md`, which the runtime
-loads as the system prompt. Both halves are needed: the store makes a *double*
-write impossible, but only the prompt stops a model from committing its own
-preview in the turn it produced it.
+### Where a change cannot be confirmed
+
+A call that belongs to no conversation gets a refusal instead of a preview
+nobody could confirm: a scheduled routine, a tool called by another plugin, a
+channel that names no conversation, or a host that does not publish the turn
+context (the activation log says so). Reading works everywhere, and so does the
+`direct` mode.
+
+### Under the Privacy Shield
+
+In the host's default privacy mode a model does not read a tool result. The
+host keeps it and hands the model a digest: numbers, dates and handles in
+clear, every other string as `[masked]`. The user sees the real values, because
+the host renders them. For `linear_prepare_write` that means the preview
+reaches the user without passing through a model at all, and the model reads
+only until when it can be confirmed.
+
+Two things follow. A result carries no instruction: a text field is shown to
+the user and masked for the model, so the one reader it was written for never
+gets it. And the prompt partial is written for both forms of a result: it
+tells the agent to quote a preview it can read, and to point at the result
+when the preview is masked.
 
 ## Layout
 
 ```
-manifest.yaml            identity, depends_on + requires, the one setup field, skills
-skills/linear-expert.md  system prompt: vocabulary, the write rule, how to answer
-src/plugin.ts            activate(ctx) -> { toolkit, close }
-src/toolkit.ts           the five tools: schemas, validation, prepare/commit
+manifest.yaml            identity, depends_on + requires, the setup fields, playbook, skills
+skills/linear-expert.md  system prompt: how results arrive, vocabulary, writes per mode, how to answer
+src/plugin.ts            activate(ctx) -> { toolkit, close }; reads the write mode
+src/toolkit.ts           the tools: schemas, validation, resolve and apply
+src/caller.ts            which conversation and turn a call belongs to
 src/lookup.ts            name -> id, with a 5-minute cache and no guessing
 src/preview.ts           descriptor -> the sentence a person says yes to
-src/preparedWrites.ts    the token store: stage, take-once, expiry
+src/preparedWrites.ts    the store of the confirm mode: one per conversation, take-once, expiry
 src/errors.ts            LinearAgentError: refusals, the errors the host passes on to the model
 ```
 
@@ -133,7 +190,17 @@ appear with no arguments at all.
   after every activation and shows in the Store. This plugin holds no
   credential to check. (`self_test: true` would oblige it to ship an
   `onConfigure` hook, which core does not call.)
-- **`linear_prepare_write` takes an enum `kind` plus flat optional fields**
+- **One setup field for the write mode, not two switches.** "Changes on or off"
+  and "confirmation on or off" exclude each other in one combination, and a
+  form that lets an operator choose it has a setting that means nothing.
+  The mode is read at activation; the host reactivates a plugin when its
+  settings change.
+- **No peer dependency on the connection.** The host's upload check compares
+  `peerDependencies` with its own packages only, so a sibling plugin listed
+  there is always reported as missing. The two plugins are tied together in
+  the manifest (`depends_on`, `requires`), and the connection is imported for
+  its types only.
+- **`linear_prepare_write` and `linear_write` take an enum `kind` plus flat optional fields**
   rather than the discriminated union its three shapes are asking for. The
   host's Zod-to-JSON-schema bridge degrades a union to `{}` without warning, so
   the per-kind field rules are enforced in `validateWriteInput` instead — and a

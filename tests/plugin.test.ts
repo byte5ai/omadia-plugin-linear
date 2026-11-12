@@ -7,7 +7,10 @@ import {
   activate,
   AGENT_ID,
   DEFAULT_TEAM_KEY_FIELD,
+  DEFAULT_WRITE_MODE,
   LINEAR_API_SERVICE_NAME,
+  TURN_CONTEXT_SERVICE_NAME,
+  WRITE_MODE_FIELD,
 } from '../src/plugin.js';
 import { createLog, createMockLinear, type MockLinear } from './fixtures.js';
 
@@ -61,6 +64,23 @@ function makeCtx(
   } as unknown as PluginContext;
 
   return { ctx, mock, logLines: lines };
+}
+
+/** A host turn context whose turn the test sets. */
+function turnContext(): { service: { current(): unknown }; turn(id: string): void } {
+  let turnId = 'turn-1';
+  return {
+    service: {
+      current: () => ({ turnId, sessionScope: 'chat-1', userId: 'user-1', agentSlug: 'fallback' }),
+    },
+    turn(id) {
+      turnId = id;
+    },
+  };
+}
+
+function toolIds(handle: { toolkit: { tools: readonly { id: string }[] } }): string[] {
+  return handle.toolkit.tools.map((t) => t.id);
 }
 
 describe('activate', () => {
@@ -134,20 +154,127 @@ describe('activate', () => {
   });
 
   it('drops staged writes on close', async () => {
-    const { ctx } = makeCtx();
+    const host = turnContext();
+    const mock = createMockLinear();
+    const { ctx } = makeCtx({
+      services: { [LINEAR_API_SERVICE_NAME]: mock.client, [TURN_CONTEXT_SERVICE_NAME]: host.service },
+    });
     const handle = await activate(ctx);
     const prepare = handle.toolkit.tools.find((t) => t.id === 'linear_prepare_write');
     const commit = handle.toolkit.tools.find((t) => t.id === 'linear_commit_write');
     assert.ok(prepare && commit);
-    const staged = (await prepare.run({
-      kind: 'add_comment',
-      issueKey: 'OMA-7',
-      body: 'note',
-    })) as { token: string };
+    await prepare.run({ kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
 
     await handle.close();
+    host.turn('turn-2');
 
-    await assert.rejects(commit.run({ token: staged.token }), /unknown/);
+    await assert.rejects(commit.run({}), /No change is waiting/);
+  });
+});
+
+describe('write mode', () => {
+  it('confirms by default, for an install that never saw the field', async () => {
+    const { ctx } = makeCtx();
+    const handle = await activate(ctx);
+    assert.equal(DEFAULT_WRITE_MODE, 'confirm');
+    assert.deepEqual(toolIds(handle).slice(3), ['linear_prepare_write', 'linear_commit_write']);
+    await handle.close();
+  });
+
+  for (const [mode, tools] of [
+    ['confirm', ['linear_prepare_write', 'linear_commit_write']],
+    ['direct', ['linear_write']],
+    ['off', []],
+  ] satisfies [string, string[]][]) {
+    it(`'${mode}' publishes ${tools.length === 0 ? 'no write tool' : tools.join(' + ')}`, async () => {
+      const { ctx, logLines } = makeCtx({
+        config: { [DEFAULT_TEAM_KEY_FIELD]: 'OMA', [WRITE_MODE_FIELD]: mode },
+      });
+      const handle = await activate(ctx);
+      assert.deepEqual(toolIds(handle).slice(3), tools);
+      assert.match(logLines.map((l) => l.map(String).join(' ')).join('\n'), new RegExp(`write mode ${mode}`));
+      await handle.close();
+    });
+  }
+
+  it('falls back to confirming on a value it does not know, and says so', async () => {
+    const { ctx, logLines } = makeCtx({
+      config: { [DEFAULT_TEAM_KEY_FIELD]: 'OMA', [WRITE_MODE_FIELD]: 'yolo' },
+    });
+    const handle = await activate(ctx);
+    assert.deepEqual(toolIds(handle).slice(3), ['linear_prepare_write', 'linear_commit_write']);
+    assert.match(
+      logLines.map((l) => l.map(String).join(' ')).join('\n'),
+      /'linear_write_mode' has the unknown value 'yolo', using 'confirm'/,
+    );
+    await handle.close();
+  });
+});
+
+describe('turn context', () => {
+  it('binds a prepared change to the conversation the host names', async () => {
+    const host = turnContext();
+    const mock = createMockLinear();
+    const { ctx } = makeCtx({
+      services: { [LINEAR_API_SERVICE_NAME]: mock.client, [TURN_CONTEXT_SERVICE_NAME]: host.service },
+    });
+    const handle = await activate(ctx);
+    const prepare = handle.toolkit.tools.find((t) => t.id === 'linear_prepare_write');
+    const commit = handle.toolkit.tools.find((t) => t.id === 'linear_commit_write');
+    assert.ok(prepare && commit);
+
+    await prepare.run({ kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
+    await assert.rejects(commit.run({}), /prepared in this same turn/);
+    assert.deepEqual(mock.mutations(), []);
+
+    host.turn('turn-2');
+    await commit.run({});
+    assert.deepEqual(mock.callsTo('addComment')[0]?.args, ['issue-7', 'note']);
+
+    await handle.close();
+  });
+
+  it('activates on a host without one, and refuses a change that needs confirming', async () => {
+    const { ctx, mock, logLines } = makeCtx();
+    const handle = await activate(ctx);
+    const prepare = handle.toolkit.tools.find((t) => t.id === 'linear_prepare_write');
+    assert.ok(prepare);
+
+    await assert.rejects(
+      prepare.run({ kind: 'add_comment', issueKey: 'OMA-7', body: 'note' }),
+      /belongs to no conversation/,
+    );
+    assert.deepEqual(mock.calls, []);
+    assert.match(
+      logLines.map((l) => l.map(String).join(' ')).join('\n'),
+      /service 'turnContext' is not available on this host/,
+    );
+    await handle.close();
+  });
+
+  it('activates on a host that throws for a service it does not grant', async () => {
+    const { ctx, mock } = makeCtx();
+    const granted = ctx.services.get.bind(ctx.services);
+    ctx.services.get = <T>(name: string): T | undefined => {
+      if (name === TURN_CONTEXT_SERVICE_NAME) throw new Error('ServiceNotDeclaredError');
+      return granted<T>(name);
+    };
+    const handle = await activate(ctx);
+    assert.equal(handle.toolkit.tools.length, 5);
+    assert.deepEqual(mock.calls, []);
+    await handle.close();
+  });
+
+  it('does not ask for a conversation in the direct mode', async () => {
+    const { ctx, mock } = makeCtx({
+      config: { [DEFAULT_TEAM_KEY_FIELD]: 'OMA', [WRITE_MODE_FIELD]: 'direct' },
+    });
+    const handle = await activate(ctx);
+    const write = handle.toolkit.tools.find((t) => t.id === 'linear_write');
+    assert.ok(write);
+    await write.run({ kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
+    assert.deepEqual(mock.callsTo('addComment')[0]?.args, ['issue-7', 'note']);
+    await handle.close();
   });
 });
 
@@ -160,7 +287,12 @@ describe('constants', () => {
     assert.equal(LINEAR_API_SERVICE_NAME, 'linear.api');
   });
 
-  it('names the one setup field', () => {
+  it('names the setup fields', () => {
     assert.equal(DEFAULT_TEAM_KEY_FIELD, 'default_team_key');
+    assert.equal(WRITE_MODE_FIELD, 'linear_write_mode');
+  });
+
+  it('names the host service the confirmation mode reads', () => {
+    assert.equal(TURN_CONTEXT_SERVICE_NAME, 'turnContext');
   });
 });

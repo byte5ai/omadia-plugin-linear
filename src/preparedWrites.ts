@@ -1,39 +1,51 @@
-import { randomUUID } from 'node:crypto';
-
 import type { UpdateIssueInput } from '@omadia/integration-linear';
 
+import type { Caller } from './caller.js';
 import { LinearAgentError, quoted } from './errors.js';
 
 /**
- * The prepared-write store — the whole of this plugin's write safety.
+ * The prepared-write store: the write gate of the confirmation mode.
  *
  * Core does not enforce a two-phase confirm for any tool kind (ADR-0005
  * describes the pattern; nothing in the kernel implements it), so the gate has
  * to live in the plugin. `linear_prepare_write` validates an instruction,
  * resolves every name to an id, renders a preview and stages the result here;
- * `linear_commit_write` is the only code path that reaches a mutating client
- * method, and it can only act on a token this store hands back.
+ * `linear_commit_write` applies what is staged, and only that.
  *
- * Three properties do the work:
+ * A staged write belongs to the conversation that prepared it. That is what
+ * lets a plain "yes" find it again: nothing has to be carried from the turn
+ * that showed the preview to the turn that confirms it.
+ *
+ * Five properties do the work:
  *
  *   - **A staged write is inert.** It is a fully resolved descriptor, not a
  *     request in flight. Nothing here touches Linear.
+ *   - **One per conversation.** What the user confirms is the one preview they
+ *     were shown last. A second prepare in the same turn is refused, because
+ *     of two previews made in one turn nobody can say which one the user saw.
+ *     A prepare in a later turn replaces the earlier one: that is a preview the
+ *     user declined or changed.
+ *   - **Not in the turn that prepared.** In that turn the user has not
+ *     answered yet, so `take()` refuses and leaves the entry where it is.
  *   - **Take-once.** `take()` removes the entry before the caller can act on
- *     it, so a token cannot apply twice — not even if the model retries a
- *     failed commit, and not even if two turns race.
+ *     it, so a prepared write cannot apply twice, not even if the model
+ *     retries a failed commit.
  *   - **It expires.** A preview describes Linear as it was when the preview was
  *     rendered. Ten minutes on, "Todo → Done" may no longer be true, so the
- *     token dies rather than applying a change the user agreed to against a
+ *     entry dies rather than applying a change the user agreed to against a
  *     different state of the world.
  *
- * In-memory on purpose: a token that survived a restart would outlive the
- * conversation that produced the preview, and confirmation is only meaningful
- * inside that conversation.
+ * In-memory on purpose: a staged write that survived a restart would outlive
+ * the moment its preview was read in.
  */
 
 /** Ten minutes. Long enough for a person to read a preview and answer, short
  *  enough that the preview still describes the issue as it is. */
 export const PREPARED_WRITE_TTL_MS = 10 * 60 * 1000;
+
+/** Longest stretch of a preview a refusal quotes to say which change is
+ *  already waiting. */
+const MAX_PENDING_PREVIEW_CHARS = 120;
 
 /** The three writes the editable set allows. Mirrors the `kind` enum of
  *  `linear_prepare_write` — see toolkit.ts. */
@@ -98,33 +110,36 @@ export type PreparedWrite =
   | PreparedAddComment;
 
 export interface PreparedWriteEntry {
-  readonly token: string;
   readonly write: PreparedWrite;
   readonly preview: string;
   /** Epoch millis. */
   readonly expiresAt: number;
+  /** The turn that staged it. A commit has to come from another one. */
+  readonly preparedInTurn: string;
 }
 
-/** Raised by `take()`. Distinct type so the commit tool can report a token
- *  problem differently from a Linear API failure. A refusal like every
- *  {@link LinearAgentError}: when `take()` throws, nothing was written. */
+/** Raised by `stage()` and `take()`. Distinct type so a caller can tell a
+ *  problem with the gate from a Linear API failure. A refusal like every
+ *  {@link LinearAgentError}: when it is thrown, nothing was written. */
 export class PreparedWriteError extends LinearAgentError {}
 
 export interface PreparedWriteStore {
-  /** Stage a validated, fully resolved write. Never touches Linear. */
-  stage(write: PreparedWrite, preview: string): PreparedWriteEntry;
-  /** Remove and return the entry. Throws {@link PreparedWriteError} when the
-   *  token is unknown, already used, or expired. */
-  take(token: string): PreparedWriteEntry;
-  /** Read without consuming. For tests and diagnostics — the commit path must
+  /** Stage a validated, fully resolved write for the caller's conversation.
+   *  Never touches Linear. Throws {@link PreparedWriteError} when a write
+   *  staged in this same turn is still waiting. */
+  stage(caller: Caller, write: PreparedWrite, preview: string): PreparedWriteEntry;
+  /** Remove and return the conversation's entry. Throws
+   *  {@link PreparedWriteError} when nothing is waiting, when it expired, or
+   *  when the call comes from the turn that staged it. */
+  take(caller: Caller): PreparedWriteEntry;
+  /** Read without consuming. For tests and diagnostics: the commit path must
    *  use {@link take}, or two concurrent commits could both see the entry. */
-  peek(token: string): PreparedWriteEntry | undefined;
+  peek(conversation: string): PreparedWriteEntry | undefined;
   /** Drop every expired entry. Returns how many went. */
   sweep(): number;
   /** Live (non-expired) entries. */
   size(): number;
-  /** Drop everything. Called on deactivate: a staged write must not survive
-   *  the conversation it was previewed in. */
+  /** Drop everything. Called on deactivate. */
   clear(): void;
 }
 
@@ -132,8 +147,6 @@ export interface PreparedWriteStoreOptions {
   readonly ttlMs?: number;
   /** Injectable clock. Tests move time instead of sleeping through a TTL. */
   readonly now?: () => number;
-  /** Injectable token source, for deterministic tests. */
-  readonly newToken?: () => string;
 }
 
 export function createPreparedWriteStore(
@@ -141,11 +154,11 @@ export function createPreparedWriteStore(
 ): PreparedWriteStore {
   const ttlMs = opts.ttlMs ?? PREPARED_WRITE_TTL_MS;
   const now = opts.now ?? (() => Date.now());
-  const newToken = opts.newToken ?? (() => randomUUID());
+  /** Keyed by conversation. */
   const entries = new Map<string, PreparedWriteEntry>();
 
   /**
-   * Sweeping is lazy — driven by `stage()` and `size()`, never by a timer.
+   * Sweeping is lazy: driven by `stage()` and `size()`, never by a timer.
    * A `setInterval` here would be a handle the plugin has to release inside
    * close()'s 5 s budget, and a leaked one keeps the whole activation alive.
    * Expiry is enforced in `take()` regardless of whether a sweep has run, so
@@ -154,9 +167,9 @@ export function createPreparedWriteStore(
   function sweep(): number {
     const t = now();
     let dropped = 0;
-    for (const [token, entry] of entries) {
+    for (const [conversation, entry] of entries) {
       if (entry.expiresAt <= t) {
-        entries.delete(token);
+        entries.delete(conversation);
         dropped += 1;
       }
     }
@@ -164,44 +177,62 @@ export function createPreparedWriteStore(
   }
 
   return {
-    stage(write, preview) {
+    stage(caller, write, preview) {
       sweep();
+      const waiting = entries.get(caller.conversation);
+      if (waiting !== undefined && waiting.preparedInTurn === caller.turn) {
+        throw new PreparedWriteError(
+          `A change is already waiting for the user's confirmation ('${quoted(waiting.preview, MAX_PENDING_PREVIEW_CHARS)}'). ` +
+            'Nothing new was prepared. One change per confirmation: hand that one off now, name the ' +
+            'changes still to come in your answer, and prepare the next one once this one is committed.',
+        );
+      }
       const entry: PreparedWriteEntry = {
-        token: newToken(),
         write,
         preview,
         expiresAt: now() + ttlMs,
+        preparedInTurn: caller.turn,
       };
-      entries.set(entry.token, entry);
+      entries.set(caller.conversation, entry);
       return entry;
     },
 
-    take(token) {
-      const entry = entries.get(token);
+    take(caller) {
+      const entry = entries.get(caller.conversation);
       if (!entry) {
         throw new PreparedWriteError(
-          `No prepared write for token '${quoted(token)}' — it is unknown, was already committed, or expired. ` +
-            'Call linear_prepare_write again, show the new preview, and commit only after the user confirms it.',
+          'No change is waiting for confirmation in this conversation: none was prepared, it was ' +
+            'already committed, or a newer one replaced it. Nothing was written. Call ' +
+            'linear_prepare_write again, show the new preview, and commit only after the user confirms it.',
         );
       }
-      // Delete first, then check expiry: an expired entry is dead either way,
-      // and deleting before any decision keeps take() unconditionally
-      // single-use even if a later edit adds an early return above.
-      entries.delete(token);
       const t = now();
       if (entry.expiresAt <= t) {
+        entries.delete(caller.conversation);
         const ageMin = Math.round((t - entry.expiresAt) / 60000);
         throw new PreparedWriteError(
-          `The prepared write for token '${quoted(token)}' expired ${ageMin > 0 ? `${String(ageMin)} minute(s)` : 'less than a minute'} ago ` +
+          `The prepared change expired ${ageMin > 0 ? `${String(ageMin)} minute(s)` : 'less than a minute'} ago ` +
             `(previews are valid for ${String(Math.round(ttlMs / 60000))} minutes). Nothing was written. ` +
             'Prepare the change again so the preview reflects the issue as it is now.',
         );
       }
+      // Checked before the entry is removed: the user may still say yes to it
+      // in the next turn.
+      if (entry.preparedInTurn === caller.turn) {
+        throw new PreparedWriteError(
+          'This change was prepared in this same turn, so the user has not seen its preview yet. ' +
+            'Nothing was written. Hand off the preview and end your turn; commit when a later ' +
+            'question says the user confirmed.',
+        );
+      }
+      // Removed before it is returned, so the entry is gone whatever the
+      // caller does with it next.
+      entries.delete(caller.conversation);
       return entry;
     },
 
-    peek(token) {
-      const entry = entries.get(token);
+    peek(conversation) {
+      const entry = entries.get(conversation);
       if (!entry) return undefined;
       return entry.expiresAt <= now() ? undefined : entry;
     },

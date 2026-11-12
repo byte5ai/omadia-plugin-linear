@@ -6,8 +6,12 @@ import { describe, it } from 'node:test';
 import {
   AGENT_ID,
   DEFAULT_TEAM_KEY_FIELD,
+  DEFAULT_WRITE_MODE,
   LINEAR_API_SERVICE_NAME,
+  TURN_CONTEXT_SERVICE_NAME,
+  WRITE_MODE_FIELD,
 } from '../src/plugin.js';
+import { isWriteMode } from '../src/toolkit.js';
 
 /**
  * Manifest, code and package.json consistency.
@@ -20,8 +24,9 @@ import {
  *     mislabelled artefact (hub versions are immutable);
  *   - an entry that disagrees with the build produces a plugin core cannot
  *     start;
- *   - `optional_requires:` instead of `requires:` would let this agent activate
- *     with no Linear connection at all and fail on the first tool call;
+ *   - the Linear API capability under `optional_requires:` instead of
+ *     `requires:` would let this agent activate with no Linear connection at
+ *     all and fail on the first tool call;
  *   - a redeclared `linear_api_key` field would override the connection's
  *     secret with an empty one and nothing would warn;
  *   - a missing `skills/` partial degrades the system prompt to nothing, taking
@@ -73,10 +78,12 @@ describe('manifest.yaml <-> package.json', () => {
     assert.equal(pkg.main, 'dist/plugin.js');
   });
 
-  it('lists the connection and zod as peers, not dependencies', () => {
-    assert.ok('@omadia/integration-linear' in pkg.peerDependencies);
-    assert.ok('@omadia/plugin-api' in pkg.peerDependencies);
-    assert.ok('zod' in pkg.peerDependencies);
+  it('lists the host packages as peers, and no sibling plugin', () => {
+    // The host's upload check compares peerDependencies with its own packages
+    // only. A sibling plugin listed here is reported to the operator as a
+    // missing dependency on every upload, however correctly it is installed;
+    // the tie to the connection is `depends_on` and `requires` in the manifest.
+    assert.deepEqual(Object.keys(pkg.peerDependencies).sort(), ['@omadia/plugin-api', 'zod']);
     assert.equal(
       (pkg as unknown as { dependencies?: unknown }).dependencies,
       undefined,
@@ -99,14 +106,21 @@ describe('manifest.yaml <-> code', () => {
   it('requires the Linear API capability, and not as an optional', () => {
     assert.deepEqual(listItems('requires'), [`${LINEAR_API_SERVICE_NAME}@^1`]);
     assert.ok(
-      !hasKey('optional_requires'),
+      !listItems('optional_requires').some((c) => c.startsWith(LINEAR_API_SERVICE_NAME)),
       'optional_requires would let this agent activate without a Linear connection',
     );
   });
 
-  it('declares exactly one setup field, and never the API key', () => {
+  it('asks for the turn context as an option, never as a prerequisite', () => {
+    // `optional_requires:` is what grants `ctx.services.get('turnContext')`.
+    // Under `requires:` a host without the service could not activate the
+    // agent at all, not even to read.
+    assert.deepEqual(listItems('optional_requires'), [`${TURN_CONTEXT_SERVICE_NAME}@1`]);
+  });
+
+  it('declares the two setup fields, and never the API key', () => {
     const keys = [...manifest.matchAll(/^\s*- key:\s*"([^"]+)"/gm)].map((m) => m[1]);
-    assert.deepEqual(keys, [DEFAULT_TEAM_KEY_FIELD]);
+    assert.deepEqual(keys, [DEFAULT_TEAM_KEY_FIELD, WRITE_MODE_FIELD]);
     // The deepEqual above already covers this; asserted separately because it
     // is the failure with no symptom — a redeclared field overrides the
     // connection's secret with an empty value and nothing warns. Matched as a
@@ -118,6 +132,20 @@ describe('manifest.yaml <-> code', () => {
     );
     assert.match(manifest, /type:\s*"string"/);
     assert.match(manifest, /required:\s*true/);
+  });
+
+  it('offers the write modes the code knows, and defaults to confirming', () => {
+    const field = /- key: "linear_write_mode"\n([\s\S]*?)\n  # `self_test/.exec(manifest)?.[1];
+    assert.ok(field, 'setup field linear_write_mode not found');
+    assert.match(field, /type: "enum"/);
+    assert.match(field, /required: false/);
+    assert.match(field, new RegExp(`default: "${DEFAULT_WRITE_MODE}"`));
+    const values = [...field.matchAll(/- value: "([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(values, ['confirm', 'direct', 'off']);
+    for (const value of values) assert.ok(isWriteMode(value), `the code does not know '${value}'`);
+    // Every label an operator reads exists in both languages.
+    assert.equal([...field.matchAll(/^\s+en: "/gm)].length, 5);
+    assert.equal([...field.matchAll(/^\s+de: "/gm)].length, 5);
   });
 
   it('claims no outbound host — egress belongs to the connection', () => {
@@ -147,6 +175,28 @@ describe('manifest.yaml <-> code', () => {
     assert.match(manifest, /when_to_use:/);
     assert.match(manifest, /not_for:/);
   });
+
+  it('tells the orchestrator its half of the write rule', () => {
+    // `when_to_use` becomes the description of `query_linear`: the one text of
+    // this package the orchestrator's model reads before it calls. It has to
+    // cover every write mode, because the text is fixed and the mode is not.
+    const whenToUse = /when_to_use: >\n((?: {4}\S.*\n)+)/.exec(manifest)?.[1]?.replace(/\s+/g, ' ');
+    assert.ok(whenToUse, 'playbook.when_to_use must be a folded block');
+    for (const needle of [
+      "How a change is applied is the operator's setting",
+      "the agent's answer says which of the two happened",
+      'Either the change is applied at once.',
+      'Or it is only prepared: nothing is written yet',
+      'the calling agent shows the user the preview and asks',
+      'When the user has confirmed, in a later turn',
+      'says that the user confirmed',
+      'One change waits per conversation, for ten minutes.',
+      'If changes are switched off, the agent says so.',
+    ]) {
+      assert.ok(whenToUse.includes(needle), `playbook.when_to_use must state: ${needle}`);
+    }
+    assert.ok(!/token/i.test(whenToUse), 'nothing is carried from one turn to the next');
+  });
 });
 
 describe('prompt partial', () => {
@@ -165,22 +215,68 @@ describe('prompt partial', () => {
     for (const needle of [
       'linear_prepare_write',
       'linear_commit_write',
-      'Never commit in the same turn as you prepared',
-      'Never commit without a token in the question you are answering',
+      'Commit only on a question that says the user confirmed.',
+      'One change per confirmation.',
+      'A commit in the turn that prepared is refused.',
     ]) {
       assert.ok(skill.includes(needle), `the prompt partial must state: ${needle}`);
     }
   });
 
-  it('explains the stateless call shape the token handoff depends on', () => {
-    // `LocalSubAgent.ask()` starts every call with one user message, so a
-    // confirmation cannot reach the agent unless the token went out in its
-    // previous answer. Without this section the write path dead-ends in
-    // repeated previews and no commit is ever possible.
+  it('says how a tool result reaches the agent', () => {
+    // On a host with a privacy filter the model gets a digest of every tool
+    // result: handles, numbers and dates, and `[masked]` for any text. A
+    // partial written for results in full asks for things the model cannot do,
+    // such as quoting a preview it never saw.
+    assert.match(skill, /## What you get back/);
+    assert.match(skill, /in full or as a \*\*digest\*\*/);
+    assert.match(skill, /shows as `\[masked\]`/);
+    assert.match(skill, /A masked value is real\./);
+    assert.match(skill, /say that the rest is\s+in the result/);
+  });
+
+  it('keys the write rules on the tools the agent has', () => {
+    // The partial is one fixed file and the write mode is the operator's
+    // setting. The model sees its tool list, so the partial lets that list
+    // say which rules apply.
+    assert.match(skill, /The write tools you have are the operator's setting/);
+    assert.match(skill, /`linear_prepare_write` and `linear_commit_write` — a change needs the user's\s+confirmation/);
+    assert.match(skill, /`linear_write` — a change is applied at once/);
+    assert.match(skill, /neither — you read only/);
+    assert.match(skill, /### With confirmation/);
+    assert.match(skill, /### Without confirmation/);
+  });
+
+  it('hands off a prepared write so the caller knows what to do next', () => {
+    assert.match(skill, /The answer is complete when it holds all five:/);
+    for (const needle of [
+      'the statement that nothing has been written yet;',
+      'what you prepared, in one sentence of your own;',
+      'verbatim when you can read it; when it is `[masked]`',
+      'until when the user can confirm;',
+      'what your caller does next: ask the user, and after their yes ask you',
+    ]) {
+      assert.ok(skill.includes(needle), `the handoff must hold: ${needle}`);
+    }
+    assert.match(skill, /After their yes, ask me again and say that the user confirmed\./);
+    assert.ok(!/token/i.test(skill), 'the agent has no handle to pass on');
+  });
+
+  it('says what the direct mode asks of the agent', () => {
+    assert.match(skill, /`linear_write` applies a change the moment you call it/);
+    assert.match(skill, /Be sure of the change first/);
+    assert.match(skill, /Call `linear_write` once per change\./);
+  });
+
+  it('explains the stateless call shape the handoff depends on', () => {
+    // `LocalSubAgent.ask()` starts every call with one user message, so the
+    // agent that receives the confirmation remembers nothing of the request.
+    // The prepared write waits in the conversation; what the agent has to do
+    // is recognise the confirmation and tell its caller how to send one.
     assert.match(skill, /## How you are called/);
     assert.match(skill, /keep no memory between those questions/);
-    assert.match(skill, /if you do not\s+return it, nobody can ever commit that write/);
-    assert.match(skill, /a token plus\s+a statement that the user confirmed/);
+    assert.match(skill, /what\s+you prepared and what your caller has to do next/);
+    assert.match(skill, /a question saying that the user confirmed\. That\s+statement is the only thing that authorises a commit/);
   });
 
   it('tells a refusal apart from a failure whose outcome is unknown', () => {
@@ -193,7 +289,7 @@ describe('prompt partial', () => {
     assert.match(skill, /\*\*Refusal\*\*/);
     assert.match(skill, /`refused the call:`/);
     assert.match(skill, /The error text was withheld/);
-    assert.match(skill, /do \*\*not\*\* prepare or commit it again on your own/);
+    assert.match(skill, /do \*\*not\*\* make the change again on\s+your own/);
   });
 
   it('uses the glossary terms', () => {
@@ -229,7 +325,6 @@ describe('prompt partial', () => {
       ['Default team', 'Standard-Team'],
       ['Prepared write', 'vorbereitete Änderung'],
       ['Preview', 'Vorschau'],
-      ['Token', 'Token'],
       ['Commit', 'übernehmen'],
     ] as const) {
       assert.ok(
@@ -238,9 +333,13 @@ describe('prompt partial', () => {
       );
     }
     assert.match(skill, /\*\*Answer in the language of the question\.\*\*/);
-    // The preview is what the user agrees to, so it is quoted as returned even
-    // inside a German answer.
-    assert.match(skill, /Es wurde noch nichts geschrieben\.[^]*OMA-7: Todo → Done, assignee unchanged/);
+    // The handoff is shown once in German: the agent's own sentences follow
+    // the question's language.
+    assert.match(skill, /Es wurde noch nichts geschrieben\. Vorbereitet: OMA-7 nach Done verschieben\./);
+    assert.match(skill, /Nach dem Ja frag mich erneut und sag, dass der Nutzer bestätigt hat\./);
+    // The preview is what the user agrees to, so a readable one is quoted as
+    // returned, whatever the language of the answer.
+    assert.match(skill, /quoted as returned:\n\n> OMA-7: Todo → Done, assignee unchanged/);
   });
 
   it('names the default team as configuration, not a hardcoded key', () => {
@@ -259,6 +358,7 @@ describe('shipped files', () => {
     'tsconfig.build.json',
     'README.md',
     'skills/linear-expert.md',
+    'src/caller.ts',
     'src/errors.ts',
     'src/lookup.ts',
     'src/plugin.ts',

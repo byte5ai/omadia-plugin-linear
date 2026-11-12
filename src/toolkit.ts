@@ -11,11 +11,11 @@ import type {
 } from '@omadia/integration-linear';
 import { z } from 'zod';
 
+import type { CallerReader } from './caller.js';
 import { LinearAgentError, quoted, rateLimitRefusal } from './errors.js';
 import { createLinearLookups, type LinearLookups } from './lookup.js';
 import {
   createPreparedWriteStore,
-  PREPARED_WRITE_TTL_MS,
   type PreparedAddComment,
   type PreparedCreateIssue,
   type PreparedFieldChange,
@@ -32,7 +32,8 @@ import {
 } from './preview.js';
 
 /**
- * The five Linear tools.
+ * The Linear tools: three that read, and the write tools of the active
+ * write mode.
  *
  * Shape and constraints come from the host, not from taste:
  *
@@ -49,12 +50,26 @@ import {
  *     union the three write shapes are begging for; the per-kind field rules are
  *     enforced in code (see `validateWriteInput`) rather than in the type.
  *
- * The write path is deliberately two tools. `linear_prepare_write` resolves,
- * validates, previews and stages; it never calls `createIssue`, `updateIssue`
- * or `addComment`. `linear_commit_write` does nothing else. A model cannot
- * change Linear without having produced a preview first, which is the only
- * point in the flow where a person can still say no.
+ * Every write is the same two steps, `resolveWrite` (validate, resolve every
+ * name, no mutation) and `applyWrite` (the only code that mutates). The write
+ * mode decides what stands between them:
+ *
+ *   - `confirm`: two tools. `linear_prepare_write` resolves, previews and
+ *     stages; `linear_commit_write` applies what is staged for the calling
+ *     conversation, in a later turn. A model cannot change Linear without a
+ *     preview having been produced first, which is the only point in the flow
+ *     where a person can still say no.
+ *   - `direct`: one tool, `linear_write`, which resolves and applies.
+ *   - `off`: no write tool at all. A tool the model is not offered is the one
+ *     it cannot call by mistake.
  */
+
+/** How a change reaches Linear. The operator's setting; see manifest.yaml. */
+export type WriteMode = 'confirm' | 'direct' | 'off';
+
+export function isWriteMode(value: unknown): value is WriteMode {
+  return value === 'confirm' || value === 'direct' || value === 'off';
+}
 
 /** Matches the kernel's uploaded-toolkit tool contract. Declared locally so the
  *  package compiles standalone: the zip-upload flow forbids reaching outside
@@ -76,6 +91,11 @@ export interface ToolkitOptions {
   /** The `default_team_key` setup field. */
   readonly defaultTeamKey: string;
   readonly log: (...args: unknown[]) => void;
+  /** Which write tools exist. */
+  readonly writeMode: WriteMode;
+  /** Who is calling: the conversation and the turn of the call in flight.
+   *  Only the `confirm` mode asks. */
+  readonly caller: CallerReader;
   /** Injectable for tests; defaults to a fresh in-memory store. */
   readonly store?: PreparedWriteStore;
   /** Injectable for tests; defaults to a lookup set over `client`. */
@@ -164,7 +184,7 @@ const lookupInput = z.object({
     .describe('Narrow the list to records whose name contains this text.'),
 }).strict();
 
-const prepareWriteInput = z.object({
+const writeInput = z.object({
   kind: z
     .enum(WRITE_KINDS)
     .describe(
@@ -222,16 +242,13 @@ const prepareWriteInput = z.object({
   body: z.string().trim().min(1).max(100_000).optional().describe('Comment text in Markdown.'),
 }).strict();
 
-const commitWriteInput = z.object({
-  token: z
-    .string()
-    .trim()
-    .min(8)
-    .max(200)
-    .describe('The token returned by linear_prepare_write.'),
-}).strict();
+/** Nothing to pass: the change to apply is the one waiting in the calling
+ *  conversation, which the host tells the tool. Strict like the others, so a
+ *  stray argument is an error the model sees rather than a value it believes
+ *  was used. */
+const commitWriteInput = z.object({}).strict();
 
-type PrepareWriteInput = z.infer<typeof prepareWriteInput>;
+type WriteInput = z.infer<typeof writeInput>;
 
 /** `assignee` values that mean "nobody". Only valid on update_issue: an issue
  *  created without an assignee is unassigned by omission. */
@@ -408,36 +425,29 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
   const prepareWrite: ToolDescriptor<unknown, unknown> = {
     id: 'linear_prepare_write',
     description:
-      'Stage a change to Linear WITHOUT applying it: create an issue, update an issue, or add a comment. ' +
-      'Resolves every name you give to a Linear record, validates the change, and returns a token plus a ' +
-      'human-readable preview. Nothing is written. Return the preview AND the token to your caller verbatim ' +
-      'and ask for the user to confirm; commit only once a request comes back carrying that token together ' +
-      'with the confirmation. The token is valid for 10 minutes and can be used once.',
-    input: prepareWriteInput as z.ZodType<unknown>,
+      'Prepare a change to Linear WITHOUT applying it: create an issue, update an issue, or add a comment. ' +
+      'Resolves every name you give to a Linear record, validates the change, and returns a human-readable ' +
+      'preview and the time until which it can be confirmed. Nothing is written. The change now waits in ' +
+      'this conversation, one at a time, for 10 minutes. Hand the preview off to your caller and ask for ' +
+      'the user to confirm; commit only when a later question says the user confirmed.',
+    input: writeInput,
     async run(raw) {
-      const input = prepareWriteInput.parse(raw);
+      const input = writeInput.parse(raw);
       validateWriteInput(input);
+      const caller = opts.caller();
+      if (caller === undefined) throw noConversation();
       log('linear_prepare_write', { kind: input.kind, issueKey: input.issueKey });
 
-      const write =
-        input.kind === 'create_issue'
-          ? await prepareCreateIssue(input, lookups)
-          : input.kind === 'update_issue'
-            ? await prepareUpdateIssue(input, client, lookups)
-            : await prepareAddComment(input, client);
-
-      const entry = store.stage(write, renderPreview(write));
+      const write = await resolveWrite(input, client, lookups);
+      const entry = store.stage(caller, write, renderPreview(write));
+      // Data only. The host may show a result to the user as a table and hand
+      // the model a digest in which every text is masked, so an instruction in
+      // here would be read by the one reader it was not written for. What to
+      // do next is said where the model does read it: in this tool's
+      // description and in the prompt partial.
       return {
-        token: entry.token,
         preview: entry.preview,
         expiresAt: new Date(entry.expiresAt).toISOString(),
-        nextStep:
-          'NOTHING HAS BEEN WRITTEN YET. End your turn here: reply to your caller with the preview and ' +
-          'this token, both verbatim, and ask for the user to confirm. Do NOT call linear_commit_write in ' +
-          'this turn — you have not been told yes yet. Commit when a later request arrives carrying this ' +
-          `token and the user's confirmation. The token expires in ${String(
-            Math.round(PREPARED_WRITE_TTL_MS / 60000),
-          )} minutes and works once.`,
       };
     },
   };
@@ -445,34 +455,68 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
   const commitWrite: ToolDescriptor<unknown, unknown> = {
     id: 'linear_commit_write',
     description:
-      'Apply a change previously staged by linear_prepare_write. Call this ONLY when the request you are ' +
-      'answering carries the token AND says the user confirmed the preview: never to "check whether it ' +
-      'works", never on your own initiative, and never in the same turn that produced the preview. Each ' +
-      'token applies exactly one change and is discarded afterwards.',
-    input: commitWriteInput as z.ZodType<unknown>,
+      'Apply the change that linear_prepare_write left waiting in this conversation. Takes no input. Call ' +
+      'this ONLY when the question you are answering says the user confirmed the preview: never to "check ' +
+      'whether it works" and never on your own initiative. It refuses in the turn that prepared the ' +
+      'change, because the user cannot have seen the preview yet. A prepared change applies exactly once.',
+    input: commitWriteInput,
     async run(raw) {
-      const { token } = commitWriteInput.parse(raw);
+      commitWriteInput.parse(raw);
+      const caller = opts.caller();
+      if (caller === undefined) throw noConversation();
       // Take before applying: the entry is gone whatever happens next, so a
       // retried or racing commit cannot apply the same change twice. The cost
       // is that a commit which fails upstream needs a fresh preview, which is
       // the safe direction of that trade.
-      const entry = store.take(token);
+      const entry = store.take(caller);
       log('linear_commit_write', { kind: entry.write.kind });
       return applyWrite(entry.write, client);
     },
   };
 
+  const write: ToolDescriptor<unknown, unknown> = {
+    id: 'linear_write',
+    description:
+      'Change Linear: create an issue, update an issue, or add a comment. Resolves every name you give to ' +
+      'a Linear record, validates the change and applies it AT ONCE; there is no preview and no undo. Call ' +
+      'it once per change, and only for a change the question asks for. When a name is ambiguous or a ' +
+      'value is missing, ask in your answer instead of calling.',
+    input: writeInput,
+    async run(raw) {
+      const input = writeInput.parse(raw);
+      validateWriteInput(input);
+      log('linear_write', { kind: input.kind, issueKey: input.issueKey });
+      return applyWrite(await resolveWrite(input, client, lookups), client);
+    },
+  };
+
+  const writeTools: Readonly<Record<WriteMode, readonly ToolDescriptor<unknown, unknown>[]>> = {
+    confirm: [prepareWrite, commitWrite],
+    direct: [write],
+    off: [],
+  };
+
   return {
-    tools: [searchIssues, getIssue, lookup, prepareWrite, commitWrite].map(reportingRateLimits),
+    tools: [searchIssues, getIssue, lookup, ...writeTools[opts.writeMode]].map(reportingRateLimits),
     async close() {
-      // Deactivation drops every staged write. It is not a conversation
-      // boundary — the kernel activates this plugin once per process, so one
-      // store serves every orchestrator — but it is the one boundary available,
-      // and a descriptor surviving an uninstall would be worse than useless.
+      // Deactivation drops every staged write: a descriptor surviving an
+      // uninstall would be worse than useless.
       store.clear();
       lookups.invalidate();
     },
   };
+}
+
+/** The refusal of the confirmation mode for a call that belongs to no
+ *  conversation: a scheduled routine, a tool called by another plugin, or a
+ *  host that publishes no turn context. A change prepared there could never
+ *  be confirmed, so it is not prepared. */
+function noConversation(): LinearAgentError {
+  return new LinearAgentError(
+    'This call belongs to no conversation, so the user cannot be asked to confirm a change here. ' +
+      'Nothing was written. Say that changes with confirmation are not available from here, and that the ' +
+      "operator can set the Linear agent's write mode to apply changes without one.",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -480,14 +524,15 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
 // ---------------------------------------------------------------------------
 
 /** What a rate limit means for the call it interrupted. A commit is the case
- *  that must not be left to inference: the token is gone (see `take()`), and a
- *  model that only hears "try again later" would retry a token that no longer
- *  exists. */
+ *  that must not be left to inference: the prepared change is gone (see
+ *  `take()`), and a model that only hears "try again later" would commit a
+ *  change that no longer waits. */
 const RATE_LIMIT_CONSEQUENCE: Readonly<Record<string, string>> = {
-  linear_prepare_write: 'Nothing was staged. Tell the user, and prepare the change again later.',
+  linear_prepare_write: 'Nothing was prepared. Tell the user, and prepare the change again later.',
   linear_commit_write:
-    'Nothing was written, and the token is used up. Tell the user, then prepare the change again ' +
-    'later and ask for a new confirmation.',
+    'Nothing was written, and the prepared change is used up. Tell the user, then prepare the change ' +
+    'again later and ask for a new confirmation.',
+  linear_write: 'Nothing was written. Tell the user, and try the change again later.',
 };
 const RATE_LIMIT_READ_CONSEQUENCE = 'Nothing was read. Tell the user, and try again later.';
 
@@ -515,14 +560,14 @@ function reportingRateLimits(
 }
 
 // ---------------------------------------------------------------------------
-// prepare: validation and resolution, no mutation
+// resolve: validation and resolution, no mutation
 // ---------------------------------------------------------------------------
 
 /** Fields that belong to each write kind. Anything else being set is a sign the
  *  model mixed two instructions, so it is refused rather than dropped: a
  *  silently ignored `stateName` on an add_comment would produce a preview the
  *  user confirms believing the state moves too. */
-const ALLOWED_FIELDS: Readonly<Record<PrepareWriteInput['kind'], readonly string[]>> = {
+const ALLOWED_FIELDS: Readonly<Record<WriteInput['kind'], readonly string[]>> = {
   create_issue: ['teamKey', 'title', 'description', 'stateName', 'assignee', 'priority', 'labels'],
   update_issue: ['issueKey', 'title', 'description', 'stateName', 'assignee', 'priority', 'labels'],
   add_comment: ['issueKey', 'body'],
@@ -537,7 +582,7 @@ const UPDATABLE_FIELDS = [
   'labels',
 ] as const;
 
-export function validateWriteInput(input: PrepareWriteInput): void {
+export function validateWriteInput(input: WriteInput): void {
   const allowed = new Set<string>(ALLOWED_FIELDS[input.kind]);
   const offending = Object.entries(input)
     .filter(([key, value]) => key !== 'kind' && value !== undefined && !allowed.has(key))
@@ -579,8 +624,25 @@ export function validateWriteInput(input: PrepareWriteInput): void {
   }
 }
 
-async function prepareCreateIssue(
-  input: PrepareWriteInput,
+/** An instruction turned into a descriptor: every name resolved to a Linear
+ *  record, every field checked against the issue as it is now. Reads only. */
+async function resolveWrite(
+  input: WriteInput,
+  client: LinearClient,
+  lookups: LinearLookups,
+): Promise<PreparedWrite> {
+  switch (input.kind) {
+    case 'create_issue':
+      return resolveCreateIssue(input, lookups);
+    case 'update_issue':
+      return resolveUpdateIssue(input, client, lookups);
+    case 'add_comment':
+      return resolveAddComment(input, client);
+  }
+}
+
+async function resolveCreateIssue(
+  input: WriteInput,
   lookups: LinearLookups,
 ): Promise<PreparedCreateIssue> {
   const team = await lookups.team(input.teamKey);
@@ -614,8 +676,8 @@ async function prepareCreateIssue(
   };
 }
 
-async function prepareUpdateIssue(
-  input: PrepareWriteInput,
+async function resolveUpdateIssue(
+  input: WriteInput,
   client: LinearClient,
   lookups: LinearLookups,
 ): Promise<PreparedUpdateIssue> {
@@ -698,7 +760,7 @@ async function prepareUpdateIssue(
     throw new LinearAgentError(
       `${issue.identifier} already matches every value you gave (${changes
         .map((c) => `${c.field}: ${quoted(c.from, MAX_NOOP_VALUE_CHARS)}`)
-        .join(', ')}). There is nothing to change, so nothing was staged.`,
+        .join(', ')}). There is nothing to change, so nothing was written.`,
     );
   }
 
@@ -712,8 +774,8 @@ async function prepareUpdateIssue(
   };
 }
 
-async function prepareAddComment(
-  input: PrepareWriteInput,
+async function resolveAddComment(
+  input: WriteInput,
   client: LinearClient,
 ): Promise<PreparedAddComment> {
   const issueKey = input.issueKey as string;
@@ -728,19 +790,19 @@ async function prepareAddComment(
 }
 
 /** `getIssue` answers `undefined` for a miss rather than throwing, and a
- *  prepared write against a non-existent issue must not reach the store. */
+ *  write against a non-existent issue must end here. */
 async function requireIssue(client: LinearClient, key: string): Promise<LinearIssueDetail> {
   const issue = await client.getIssue(key);
   if (!issue) {
     throw new LinearAgentError(
-      `No issue '${quoted(key)}'. Nothing was staged. Check the key, or search for the issue first.`,
+      `No issue '${quoted(key)}'. Nothing was written. Check the key, or search for the issue first.`,
     );
   }
   return issue;
 }
 
 // ---------------------------------------------------------------------------
-// commit: the only mutating code path
+// apply: the only mutating code path
 // ---------------------------------------------------------------------------
 
 async function applyWrite(

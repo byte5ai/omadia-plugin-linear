@@ -12,6 +12,8 @@ import type {
   UpdateIssueInput,
 } from '@omadia/integration-linear';
 
+import type { Caller, CallerReader } from '../src/caller.js';
+
 /**
  * A stand-in for the Linear API capability.
  *
@@ -286,4 +288,43 @@ export function createMockLinear(
 export function createLog(): { log: (...args: unknown[]) => void; lines: unknown[][] } {
   const lines: unknown[][] = [];
   return { log: (...args: unknown[]) => void lines.push(args), lines };
+}
+
+/**
+ * A conversation whose turns the test advances by hand.
+ *
+ * The write gate asks the host which conversation and which turn a tool call
+ * belongs to. In a test that answer is this object: `next()` is the user
+ * sending another message, `switchTo()` a call arriving from somewhere else,
+ * `leave()` a call that belongs to no conversation at all.
+ */
+export interface Turns {
+  readonly caller: CallerReader;
+  next(): void;
+  switchTo(conversation: string): void;
+  leave(): void;
+}
+
+/** The conversation a fresh {@link createTurns} starts in. */
+export const CONVERSATION = 'conversation-1';
+
+export function createTurns(): Turns {
+  let count = 1;
+  let now: Caller | undefined = { conversation: CONVERSATION, turn: 'turn-1' };
+  const nextTurn = (): string => {
+    count += 1;
+    return `turn-${String(count)}`;
+  };
+  return {
+    caller: () => now,
+    next() {
+      if (now !== undefined) now = { conversation: now.conversation, turn: nextTurn() };
+    },
+    switchTo(conversation) {
+      now = { conversation, turn: nextTurn() };
+    },
+    leave() {
+      now = undefined;
+    },
+  };
 }

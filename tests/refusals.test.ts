@@ -15,12 +15,15 @@ import { LinearLookupError, listOf } from '../src/lookup.js';
 import { createPreparedWriteStore, PreparedWriteError } from '../src/preparedWrites.js';
 import { createToolkit, type ToolDescriptor, type Toolkit } from '../src/toolkit.js';
 import {
+  CONVERSATION,
   createLog,
   createMockLinear,
+  createTurns,
   LABEL_BUG,
   makeIssue,
   TEAM_OMA,
   VIEWER,
+  type Turns,
 } from './fixtures.js';
 
 // ---------------------------------------------------------------------------
@@ -103,16 +106,20 @@ function setup(
   toolkit: Toolkit;
   mock: ReturnType<typeof createMockLinear>;
   store: ReturnType<typeof createPreparedWriteStore>;
+  turns: Turns;
 } {
   const mock = createMockLinear(options);
   const store = createPreparedWriteStore(storeOptions);
+  const turns = createTurns();
   const toolkit = createToolkit({
     client: { ...mock.client, ...override },
     defaultTeamKey: 'OMA',
     log: createLog().log,
+    writeMode: 'confirm',
+    caller: turns.caller,
     store,
   });
-  return { toolkit, mock, store };
+  return { toolkit, mock, store, turns };
 }
 
 async function call(toolkit: Toolkit, id: string, input: unknown): Promise<string> {
@@ -131,10 +138,11 @@ async function refusal(toolkit: Toolkit, id: string, input: unknown): Promise<st
   return text.slice(REFUSED(id).length);
 }
 
-async function token(toolkit: Toolkit, input: unknown): Promise<string> {
+/** Stage a write in the current turn. */
+async function prepare(toolkit: Toolkit, input: unknown): Promise<void> {
   const tool = toolkit.tools.find((t) => t.id === 'linear_prepare_write');
   assert.ok(tool);
-  return ((await tool.run(input)) as { token: string }).token;
+  await tool.run(input);
 }
 
 /** An error as the Linear connection throws it. The connection is a separate
@@ -234,14 +242,14 @@ describe('refusals reach the model as readable text', () => {
     assert.equal(text, "No issue 'OMA-999'. Check the key, or search for the issue by title first.");
   });
 
-  it('a missing issue says nothing was staged on a write', async () => {
+  it('a missing issue says nothing was written on a write', async () => {
     const { toolkit, store } = setup();
     const text = await refusal(toolkit, 'linear_prepare_write', {
       kind: 'add_comment',
       issueKey: 'OMA-999',
       body: 'hello',
     });
-    assert.match(text, /^No issue 'OMA-999'\. Nothing was staged\./);
+    assert.match(text, /^No issue 'OMA-999'\. Nothing was written\./);
     assert.equal(store.size(), 0);
   });
 
@@ -264,40 +272,91 @@ describe('refusals reach the model as readable text', () => {
       priority: 3,
     });
     assert.match(text, /^OMA-7 already matches every value you gave \(priority: Medium\)\./);
-    assert.match(text, /nothing was staged\.$/);
+    assert.match(text, /nothing was written\.$/);
     assert.equal(store.size(), 0);
   });
 
-  it('an unknown token tells the model to prepare again', async () => {
+  it('a commit with nothing prepared tells the model to prepare again', async () => {
     const { toolkit, mock } = setup();
-    const text = await refusal(toolkit, 'linear_commit_write', { token: 'made-up-token' });
-    assert.match(text, /^No prepared write for token 'made-up-token'/);
-    assert.match(text, /Call linear_prepare_write again/);
+    const text = await refusal(toolkit, 'linear_commit_write', {});
+    assert.match(text, /^No change is waiting for confirmation in this conversation/);
+    assert.match(text, /Nothing was written\. Call linear_prepare_write again/);
+    assert.match(text, /commit only after the user confirms it\.$/);
+    assertPassable(text);
     assert.deepEqual(mock.mutations(), []);
   });
 
-  it('an expired token says it expired and that nothing was written', async () => {
+  it('an expired change says it expired and that nothing was written', async () => {
     let t = 1_000_000;
-    const { toolkit, mock } = setup({}, { now: () => t, ttlMs: 10 * 60_000 });
-    const staged = await token(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'late' });
+    const { toolkit, mock, turns } = setup({}, { now: () => t, ttlMs: 10 * 60_000 });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'late' });
 
     t += 12 * 60_000;
+    turns.next();
 
-    const text = await refusal(toolkit, 'linear_commit_write', { token: staged });
+    const text = await refusal(toolkit, 'linear_commit_write', {});
     assert.match(text, /expired 2 minute\(s\) ago \(previews are valid for 10 minutes\)/);
     assert.match(text, /Nothing was written\. Prepare the change again/);
     assert.deepEqual(mock.mutations(), []);
   });
 
-  it('a token used twice is refused the second time', async () => {
-    const { toolkit, mock } = setup();
-    const staged = await token(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'once' });
+  it('a change committed twice is refused the second time', async () => {
+    const { toolkit, mock, turns } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'once' });
+    turns.next();
 
-    assert.match(await call(toolkit, 'linear_commit_write', { token: staged }), /"committed": true/);
-    const text = await refusal(toolkit, 'linear_commit_write', { token: staged });
+    assert.match(await call(toolkit, 'linear_commit_write', {}), /"committed": true/);
+    const text = await refusal(toolkit, 'linear_commit_write', {});
 
     assert.match(text, /already committed/);
     assert.equal(mock.mutations().length, 1);
+  });
+
+  it('a commit in the turn that prepared says why, and what to do', async () => {
+    const { toolkit, mock, store } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'note' });
+
+    const text = await refusal(toolkit, 'linear_commit_write', {});
+
+    assert.equal(
+      text,
+      'This change was prepared in this same turn, so the user has not seen its preview yet. ' +
+        'Nothing was written. Hand off the preview and end your turn; commit when a later ' +
+        'question says the user confirmed.',
+    );
+    assert.deepEqual(mock.mutations(), []);
+    assert.ok(store.peek(CONVERSATION), 'the change must still wait for the next turn');
+  });
+
+  it('a second change in one turn names the one already waiting', async () => {
+    const { toolkit } = setup();
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'first' });
+
+    const text = await refusal(toolkit, 'linear_prepare_write', {
+      kind: 'create_issue',
+      title: 'second',
+    });
+
+    assert.match(text, /^A change is already waiting for the user's confirmation \('Comment on OMA-7 /);
+    assert.match(text, /Nothing new was prepared\. One change per confirmation:/);
+    assert.match(text, /prepare the next one once this one is committed\.$/);
+    assertPassable(text);
+  });
+
+  it('a call outside any conversation says that it cannot be confirmed there', async () => {
+    const { toolkit, turns } = setup();
+    turns.leave();
+
+    for (const [id, input] of [
+      ['linear_prepare_write', { kind: 'create_issue', title: 'x' }],
+      ['linear_commit_write', {}],
+    ] satisfies [string, unknown][]) {
+      const text = await refusal(toolkit, id, input);
+      assert.match(text, /^This call belongs to no conversation/);
+      assert.match(text, /Nothing was written\./);
+      assert.match(text, /write mode to apply changes without one\.$/);
+      assertPassable(text);
+    }
   });
 
   it('a misspelt field stays a readable input hint', async () => {
@@ -418,11 +477,16 @@ describe('a refusal always fits what the host passes on', () => {
     assert.match(text, /lists them all\)\.$/);
   });
 
-  it('the longest allowed token does not push the instruction out', async () => {
+  it('a long preview does not push the instruction out of the "already waiting" refusal', async () => {
     const { toolkit } = setup();
-    const text = await refusal(toolkit, 'linear_commit_write', { token: 't'.repeat(200) });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x'.repeat(5_000) });
+
+    const text = await refusal(toolkit, 'linear_prepare_write', {
+      kind: 'create_issue',
+      title: 'second',
+    });
     assertPassable(text);
-    assert.match(text, /commit only after the user confirms it\.$/);
+    assert.match(text, /prepare the next one once this one is committed\.$/);
   });
 
   it('a no-op naming every field of a long issue stays complete', async () => {
@@ -442,7 +506,7 @@ describe('a refusal always fits what the host passes on', () => {
       labels: ['bug', 'mobile'],
     });
     assertPassable(text);
-    assert.match(text, /There is nothing to change, so nothing was staged\.$/);
+    assert.match(text, /There is nothing to change, so nothing was written\.$/);
   });
 });
 
@@ -467,13 +531,14 @@ describe('connection failures', () => {
   }
 
   it('a failed mutation stays withheld, with the outcome reported as unknown', async () => {
-    const { toolkit } = setup({}, {}, {
+    const { toolkit, turns } = setup({}, {}, {
       async addComment() {
         throw connectionError('LinearMutationError', 'commentCreate returned success: false');
       },
     });
-    const staged = await token(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x' });
-    const text = await call(toolkit, 'linear_commit_write', { token: staged });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x' });
+    turns.next();
+    const text = await call(toolkit, 'linear_commit_write', {});
     assert.match(text, WITHHELD);
     assert.match(text, /The outcome is unknown/);
     assert.ok(!text.includes('success: false'));
@@ -511,7 +576,7 @@ describe('connection failures', () => {
     );
   });
 
-  it('a rate limit while preparing says nothing was staged', async () => {
+  it('a rate limit while preparing says nothing was prepared', async () => {
     const { toolkit, store } = setup({}, {}, {
       async workflowStates() {
         throw connectionError('LinearRateLimitError', 'RATELIMITED');
@@ -522,30 +587,28 @@ describe('connection failures', () => {
       issueKey: 'OMA-7',
       stateName: 'Done',
     });
-    assert.match(text, /Nothing was staged\. Tell the user, and prepare the change again later\.$/);
+    assert.match(text, /Nothing was prepared\. Tell the user, and prepare the change again later\.$/);
     assert.equal(store.size(), 0);
   });
 
-  it('a rate limit on commit says the token is used up, and it is', async () => {
-    const { toolkit, store } = setup({}, {}, {
+  it('a rate limit on commit says the prepared change is used up, and it is', async () => {
+    const { toolkit, store, turns } = setup({}, {}, {
       async addComment() {
         throw connectionError('LinearRateLimitError', 'RATELIMITED', {
           resetAt: new Date('2026-11-12T15:30:00.000Z'),
         });
       },
     });
-    const staged = await token(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x' });
+    await prepare(toolkit, { kind: 'add_comment', issueKey: 'OMA-7', body: 'x' });
+    turns.next();
 
-    const text = await refusal(toolkit, 'linear_commit_write', { token: staged });
-    assert.match(text, /Nothing was written, and the token is used up\./);
+    const text = await refusal(toolkit, 'linear_commit_write', {});
+    assert.match(text, /Nothing was written, and the prepared change is used up\./);
     assert.match(text, /prepare the change again later and ask for a new confirmation\.$/);
     assertPassable(text);
 
-    assert.equal(store.peek(staged), undefined);
-    assert.match(
-      await refusal(toolkit, 'linear_commit_write', { token: staged }),
-      /^No prepared write for token/,
-    );
+    assert.equal(store.peek(CONVERSATION), undefined);
+    assert.match(await refusal(toolkit, 'linear_commit_write', {}), /^No change is waiting/);
   });
 
   it('only a rate limit is turned into a refusal', () => {
