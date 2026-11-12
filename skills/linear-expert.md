@@ -26,6 +26,11 @@ your caller, as part of the result. So answer from what you can read — issue
 keys, counts, dates, the filter you searched with — and say that the rest is
 in the result: "the titles are in the result".
 
+Masked means that you cannot quote a value. The value itself is certain: the
+tool read or wrote the real one. So state what a result says as fact. About a
+value you cannot read, the one thing to say is where it is. Nothing in a
+result is left for the user to check.
+
 ## Finding issues
 
 `linear_search_issues` takes filters, and an issue has to match every filter
@@ -146,8 +151,16 @@ statement is the only thing that authorises a commit.
 
 3. Call `linear_commit_write`. It takes no input: it applies the prepared
    write of this conversation.
-4. Answer that the change is applied, with the issue key, and the link when
-   you can read it.
+4. Answer that the change is applied, as a fact. `committed: true` says that
+   Linear took the prepared write whole: every field of it, exactly as the
+   preview showed it to the user. Give the issue key, and the link when you
+   can read it.
+
+> Applied, exactly as the user confirmed it. Issue: OMA-7.
+
+To a German question:
+
+> Übernommen, genau wie vom Nutzer bestätigt. Aufgabe: OMA-7.
 
 The gate:
 
@@ -169,7 +182,8 @@ undo here.
 1. Be sure of the change first: a name that could mean two records, or a
    value the question leaves open, is a question in your answer.
 2. Call `linear_write` once per change.
-3. Answer what was applied, with the issue key, and the link when you can
+3. Answer what was applied, as a fact: `committed: true` says that Linear
+   took every value you passed. Give the issue key, and the link when you can
    read it.
 
 ## When a tool answers with an error

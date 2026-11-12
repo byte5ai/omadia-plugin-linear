@@ -190,6 +190,9 @@ describe('manifest.yaml <-> code', () => {
       'the calling agent shows the user the preview and asks',
       'When the user has confirmed, in a later turn',
       'says that the user confirmed',
+      'the prepared change is then applied, exactly as the preview showed it.',
+      "When the agent's answer says that a change is applied, it was written in full",
+      'the user is told what was done and is not asked to check it.',
       'One change waits per conversation, for ten minutes.',
       'If changes are switched off, the agent says so.',
     ]) {
@@ -233,6 +236,23 @@ describe('prompt partial', () => {
     assert.match(skill, /shows as `\[masked\]`/);
     assert.match(skill, /A masked value is real\./);
     assert.match(skill, /say that the rest is\s+in the result/);
+  });
+
+  it('takes a masked value for certain, and reports an applied change as fact', () => {
+    // From a commit result a model on a masking host reads `committed` and
+    // the issue key. Without these lines it reports the rest as unchecked and
+    // has the user verify a change that was written exactly as previewed.
+    assert.match(skill, /Masked means that you cannot quote a value\. The value itself is certain/);
+    assert.match(skill, /state what a result says as fact/);
+    assert.match(skill, /Nothing in a\s+result is left for the user to check\./);
+    assert.match(
+      skill,
+      /`committed: true` says that\s+Linear took the prepared write whole: every field of it, exactly as the\s+preview showed it to the user/,
+    );
+    assert.match(skill, /> Applied, exactly as the user confirmed it\. Issue: OMA-7\./);
+    assert.match(skill, /> Übernommen, genau wie vom Nutzer bestätigt\. Aufgabe: OMA-7\./);
+    // The direct mode has no preview; the fact is that every value passed was taken.
+    assert.match(skill, /`committed: true` says that Linear\s+took every value you passed/);
   });
 
   it('keys the write rules on the tools the agent has', () => {

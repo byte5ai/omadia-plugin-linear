@@ -179,6 +179,13 @@ gets it. And the prompt partial is written for both forms of a result: it
 tells the agent to quote a preview it can read, and to point at the result
 when the preview is masked.
 
+A masked value is not an uncertain one. Of a commit result a model reads
+`committed` and the issue key, and nothing of the title, the state or the
+priority. Left to itself it reports that as "could not be checked" and asks
+the user to look. The prompt partial and `playbook.when_to_use` therefore say
+what `committed: true` means: Linear took the whole change, exactly as the
+preview showed it, and the answer states that as fact.
+
 ## Layout
 
 ```
