@@ -21,27 +21,111 @@ anything here.
 
 ## Install
 
-1. Install and configure `@omadia/integration-linear` first. Without it this
-   plugin's `requires:` is unresolved and it will not activate.
-2. `npm run build` here, then upload `out/omadia-agent-linear-<version>.zip`
-   via Admin → Store → tab "Lokal". (Or
+You need a Linear workspace and a personal API key of one of its members
+(Linear → Settings → Security & access → Personal API keys); Linear's Free
+plan is enough. The key goes into the connection, not into this plugin.
+
+1. Install and configure `@omadia/integration-linear` first, and check it
+   with **Verbindung testen** (see its README). Without it this plugin's
+   `requires:` is unresolved and it will not activate.
+2. `npm run build` here, then in the web UI: **Store** (`/store`) → source
+   switch **Lokal** → box "Neues Agent-Package hochladen." → **Datei wählen**
+   → `out/omadia-agent-linear-<version>.zip`. Expect "✓ Hochgeladen" and a
+   second card **Linear**, of kind agent. (Or
    `POST /api/v1/install/plugins/:id` followed by `/configure`.)
-3. Enter the **default team key** — the prefix of that team's issue keys, so
-   `OMA` for `OMA-7`. It is the team used whenever a request does not name one.
-4. Choose how **changes to Linear** are made (`linear_write_mode`):
+3. Install the card and enter the **Standard-Teamkürzel** (default team
+   key) — the prefix of that team's issue keys, so `OMA` for `OMA-7`. It is
+   the team used whenever a request does not name one.
+4. Choose how **changes to Linear** are made (field **Änderungen in Linear**,
+   `linear_write_mode`):
 
    | Value | What the agent does |
    |---|---|
-   | `confirm` (default) | Shows every change as a preview and applies it only after the user says yes in the conversation. |
-   | `direct` | Applies a change as soon as it is asked for. No preview, no undo. |
-   | `off` | Reads only. The write tools are not offered to the model at all. |
+   | `confirm` — "Mit Bestätigung (empfohlen)", the default | Shows every change as a preview and applies it only after the user says yes in the conversation. |
+   | `direct` — "Ohne Bestätigung" | Applies a change as soon as it is asked for. No preview, no undo. |
+   | `off` — "Aus (nur lesen)" | Reads only. The write tools are not offered to the model at all. |
 
    A Linear API key restricted to reading passes the connection check all the
    same, because that check only reads. With such a key choose `off`:
    otherwise the agent offers changes that all fail at Linear.
+5. **Installation bestätigen.** The host attaches the plugin to the default
+   agent on its own (`fallback`, the agent behind the channels); there is
+   nothing to attach by hand. Both settings can be changed later on the
+   plugin's page, section **Setup-Felder editieren**; saving reactivates the
+   plugin with the new values.
+
+**Updating:** upload a newer zip the same way. It replaces the installed
+version, keeps the settings and reactivates the plugin; there is no install
+step. When a release raises the capability it needs (`linear.api@^1` →
+`@^2`), upload the connection first. Uploaded the other way round, the host
+has been seen to activate the agent anyway, against the old connection.
 
 The orchestrator reaches this agent as the tool `query_linear`, derived from the
 plugin id. The tools below are the sub-agent's, not the orchestrator's.
+
+## Using it
+
+Ask in any channel bound to the default agent, in German or English. Name
+the team when it is not the default one. For example:
+
+- *Welche Aufgaben sind im Team OMA offen?*
+- *Was haben wir in den letzten zwei Wochen erledigt?*
+- *Was steht in OMA-7?*
+- *Zeig mir alle dringenden Aufgaben mit dem Label Bug.*
+- *Welcher Zyklus läuft gerade, und was ist darin?*
+- *Lege in OMA eine Aufgabe an: Titel "Login prüfen", Priorität hoch.*
+- *Verschiebe OMA-7 nach Done.* / *Kommentiere OMA-7 mit "erledigt".*
+
+With confirmation on, a change comes back as a preview with the time until
+which it can be confirmed, and nothing is written yet. A plain "Ja" in the
+same conversation applies it; the answer names the issue key. A different
+wording ("nein, schreib stattdessen …") replaces the preview. A preview is
+valid for ten minutes; a yes after that is told the preview expired, and the
+agent prepares it again for a new yes. Several changes asked for at once are
+confirmed one after the other.
+
+Everything written appears in Linear under the owner of the API key, not
+under the person who asked.
+
+## Known limits
+
+- **One identity.** Every read and every change acts as the owner of the API
+  key. Who asked in omadia is not visible in Linear, and everyone who can
+  reach the default agent can read what that key can read. Per-user identity
+  would need OAuth, which is not built.
+- **No Push.** Linear does not notify omadia; the agent answers only when
+  asked.
+- **Speed.** A Linear question passes two models in a row (the main agent,
+  then this agent), so an answer takes about 10–30 seconds. Linear itself
+  answers in well under a second.
+- **Rate limits.** A personal key is capped by Linear (near 2,500 requests an
+  hour). Past the cap the agent says so and names the time the limit resets.
+- **Privacy Shield.** In the default privacy mode the models read a digest of
+  each result (numbers, dates, keys) and the user sees the real values in
+  the table the host renders. Answers therefore often point at the table
+  instead of repeating titles or names.
+- **Not editable:** project, cycle, estimate, parent, due date. No delete and
+  no archive; closing an issue is a move to a completed or canceled state.
+- **"No" does not discard a preview.** It stays confirmable until it expires
+  or is replaced — see the write gate below.
+- **No confirmation outside a conversation.** A scheduled routine or a call
+  from another plugin cannot confirm a change; there only reading and the
+  `direct` mode work.
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+|---|---|---|
+| Red badge and banner on the Linear connection; the chat answer says Linear rejected the API key. | The key was revoked, mistyped or belongs to another workspace. Log: `connection check: Linear rejected the API key (http_401)`, at call time `Linear rejected the API key during a request (http_401) — status set to error`. | Paste a valid key on the connection's page, section **Setup-Felder editieren**, then **Verbindung testen**. |
+| The agent does not activate, or the install reports a missing capability. | The connection is not installed, or is older than the capability this agent requires. | Install or update the connection, then the agent. |
+| Reading works, every change fails at Linear. | The API key is restricted to reading. | Set **Änderungen in Linear** to "Aus (nur lesen)", or use a key with write access. |
+| "The prepared change expired …" after a yes. | More than ten minutes passed since the preview. | Ask for the change again and confirm the new preview. |
+| "No change is waiting for confirmation …" after a yes. | The change was already written, a newer preview replaced it, or it expired more than a day ago. | Check Linear; ask for the change again if it is missing. |
+| "Linear is rate-limiting this API key …" | The key's request budget is spent. | Wait until the reset time named in the answer. |
+| "No projects", "no current cycle", nothing in triage. | The team does not use projects or cycles, or triage is off (Linear → team settings). | Nothing to fix in omadia. |
+| "No team with key …", listing other keys. | **Standard-Teamkürzel** is wrong, or the request named an unknown team. | Correct the setting on the plugin's page. |
+| Changes are refused with "This call belongs to no conversation …". | The call came from a routine or another plugin, where nobody can confirm. | Ask in a chat, or use the `direct` mode for automated changes. |
+| An answer mentions a preview from another chat. | The host adds matching turns from the same user's other chats to the context. A preview stays bound to the conversation that made it and cannot be confirmed elsewhere. | Nothing to fix; confirm in the chat that showed the preview. |
 
 ## The tools
 
