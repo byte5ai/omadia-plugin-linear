@@ -2,9 +2,11 @@ import type {
   CreateIssueInput,
   LinearClient,
   LinearComment,
+  LinearCycle,
   LinearIssue,
   LinearIssueDetail,
   LinearLabel,
+  LinearProject,
   LinearTeam,
   LinearUser,
   LinearWorkflowState,
@@ -127,6 +129,68 @@ export const LABEL_WORKSPACE: LinearLabel = {
   teamId: undefined,
 };
 
+export const PROJECT_MOBILE: LinearProject = {
+  id: 'project-mobile',
+  name: 'Mobile app',
+  url: 'https://linear.app/omadia-dev/project/mobile-app',
+  status: { name: 'In Progress', type: 'started' },
+  startDate: '2026-10-01',
+  targetDate: '2026-12-15',
+};
+export const PROJECT_MOBILE_V2: LinearProject = {
+  id: 'project-mobile-v2',
+  name: 'Mobile app v2',
+  url: 'https://linear.app/omadia-dev/project/mobile-app-v2',
+  status: { name: 'Planned', type: 'planned' },
+  startDate: undefined,
+  targetDate: undefined,
+};
+export const PROJECT_BILLING: LinearProject = {
+  id: 'project-billing',
+  name: 'Billing',
+  url: 'https://linear.app/omadia-dev/project/billing',
+  status: { name: 'Done', type: 'completed' },
+  startDate: '2026-06-01',
+  targetDate: '2026-09-30',
+};
+
+export const CYCLE_PAST: LinearCycle = {
+  id: 'cycle-10',
+  number: 10,
+  name: undefined,
+  startsAt: '2026-10-12T00:00:00.000Z',
+  endsAt: '2026-10-26T00:00:00.000Z',
+  phase: 'past',
+  teamId: TEAM_OMA.id,
+};
+export const CYCLE_PREVIOUS: LinearCycle = {
+  id: 'cycle-11',
+  number: 11,
+  name: undefined,
+  startsAt: '2026-10-26T00:00:00.000Z',
+  endsAt: '2026-11-09T00:00:00.000Z',
+  phase: 'previous',
+  teamId: TEAM_OMA.id,
+};
+export const CYCLE_CURRENT: LinearCycle = {
+  id: 'cycle-12',
+  number: 12,
+  name: 'Launch',
+  startsAt: '2026-11-09T00:00:00.000Z',
+  endsAt: '2026-11-23T00:00:00.000Z',
+  phase: 'current',
+  teamId: TEAM_OMA.id,
+};
+export const CYCLE_NEXT: LinearCycle = {
+  id: 'cycle-13',
+  number: 13,
+  name: undefined,
+  startsAt: '2026-11-23T00:00:00.000Z',
+  endsAt: '2026-12-07T00:00:00.000Z',
+  phase: 'next',
+  teamId: TEAM_OMA.id,
+};
+
 export function makeIssue(overrides: Partial<LinearIssueDetail> = {}): LinearIssueDetail {
   return {
     id: 'issue-7',
@@ -141,6 +205,8 @@ export function makeIssue(overrides: Partial<LinearIssueDetail> = {}): LinearIss
     assignee: { id: VIEWER.id, name: VIEWER.name, displayName: VIEWER.displayName },
     team: TEAM_OMA,
     labels: ['bug'],
+    project: undefined,
+    cycle: undefined,
     description: 'Safari 17 rejects the session cookie.',
     comments: [],
     ...overrides,
@@ -165,7 +231,11 @@ export function createMockLinear(
     states?: readonly LinearWorkflowState[];
     users?: readonly LinearUser[];
     labels?: readonly LinearLabel[];
+    projects?: readonly LinearProject[];
+    cycles?: readonly LinearCycle[];
     searchResult?: readonly LinearIssue[];
+    /** The cursor a search hands out for the page after the one it returns. */
+    searchNextCursor?: string;
   } = {},
 ): MockLinear {
   const calls: RecordedCall[] = [];
@@ -182,6 +252,8 @@ export function createMockLinear(
   const states = options.states ?? [STATE_BACKLOG, STATE_TODO, STATE_IN_PROGRESS, STATE_DONE];
   const users = options.users ?? [VIEWER, USER_KIM_LEE, USER_KIM_PARK, USER_INACTIVE];
   const labels = options.labels ?? [LABEL_BUG, LABEL_MOBILE, LABEL_WORKSPACE];
+  const projects = options.projects ?? [PROJECT_MOBILE, PROJECT_MOBILE_V2, PROJECT_BILLING];
+  const cycles = options.cycles ?? [CYCLE_PAST, CYCLE_PREVIOUS, CYCLE_CURRENT, CYCLE_NEXT];
 
   const client: LinearClient = {
     async viewer() {
@@ -204,9 +276,22 @@ export function createMockLinear(
       record('labels', teamId);
       return labels.filter((l) => l.teamId === undefined || l.teamId === teamId);
     },
+    async projects() {
+      record('projects');
+      return [...projects];
+    },
+    async cycles(teamId) {
+      record('cycles', teamId);
+      return cycles.filter((c) => c.teamId === teamId);
+    },
     async searchIssues(input: SearchIssuesInput) {
-      record('searchIssues', input);
-      return [...(options.searchResult ?? [...issues.values()].slice(0, 1))];
+      // Recorded the way it reaches Linear: a filter left undefined is a
+      // filter not sent, and a test should not have to tell the two apart.
+      record('searchIssues', JSON.parse(JSON.stringify(input)));
+      return {
+        issues: [...(options.searchResult ?? [...issues.values()].slice(0, 1))],
+        nextCursor: options.searchNextCursor,
+      };
     },
     async getIssue(keyOrId) {
       record('getIssue', keyOrId);

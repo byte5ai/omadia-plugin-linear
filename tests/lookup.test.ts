@@ -5,14 +5,21 @@ import type { LinearClient } from '@omadia/integration-linear';
 
 import {
   createLinearLookups,
+  cycleLabel,
   LinearLookupError,
   LOOKUP_CACHE_TTL_MS,
   matchByName,
 } from '../src/lookup.js';
 import {
   createMockLinear,
+  CYCLE_CURRENT,
+  CYCLE_NEXT,
+  CYCLE_PAST,
+  CYCLE_PREVIOUS,
   LABEL_BUG,
   LABEL_MOBILE,
+  PROJECT_BILLING,
+  PROJECT_MOBILE,
   STATE_DONE,
   STATE_DONE_DEPLOY,
   STATE_TODO,
@@ -169,6 +176,136 @@ describe('labelSet', () => {
       assert.match(err.message, /needs-triage/);
       return true;
     });
+  });
+});
+
+describe('label', () => {
+  it('resolves one label of the team, case-insensitively', async () => {
+    const { lookups: l } = lookups();
+    assert.equal((await l.label(TEAM_OMA, 'BUG')).id, LABEL_BUG.id);
+  });
+
+  it('refuses an unknown label and lists what is available', async () => {
+    const { lookups: l } = lookups();
+    await assert.rejects(
+      () => l.label(TEAM_OMA, 'urgent'),
+      (err: unknown) =>
+        err instanceof LinearLookupError &&
+        /no label matching 'urgent'.*bug, mobile, needs-triage/s.test(err.message),
+    );
+  });
+});
+
+describe('project', () => {
+  it('resolves a project by name, case-insensitively', async () => {
+    const { lookups: l } = lookups();
+    assert.equal((await l.project('billing')).id, PROJECT_BILLING.id);
+  });
+
+  it('prefers the exact name over a longer one that contains it', async () => {
+    // "Mobile app" and "Mobile app v2" both contain the name.
+    const { lookups: l } = lookups();
+    assert.equal((await l.project('Mobile app')).id, PROJECT_MOBILE.id);
+  });
+
+  it('refuses a name that fits several projects and names them', async () => {
+    const { lookups: l } = lookups();
+    await assert.rejects(
+      () => l.project('mobile'),
+      (err: unknown) =>
+        err instanceof LinearLookupError &&
+        /'mobile' matches several projects: Mobile app, Mobile app v2\. Use the exact name\./.test(
+          err.message,
+        ),
+    );
+  });
+
+  it('refuses an unknown project and lists the ones that exist', async () => {
+    const { lookups: l } = lookups();
+    await assert.rejects(
+      () => l.project('Roadmap'),
+      (err: unknown) =>
+        err instanceof LinearLookupError &&
+        /No project matches 'Roadmap'\. Projects: Mobile app, Mobile app v2, Billing\./.test(
+          err.message,
+        ),
+    );
+  });
+
+  it('fetches the project list once for any number of names', async () => {
+    const { lookups: l, mock } = lookups();
+    await l.project('Billing');
+    await l.project('Mobile app');
+    assert.equal(mock.callsTo('projects').length, 1);
+  });
+});
+
+describe('cycle', () => {
+  it('resolves the current, the next and the previous cycle by those words', async () => {
+    const { lookups: l } = lookups();
+    assert.equal((await l.cycle(TEAM_OMA, 'current')).id, CYCLE_CURRENT.id);
+    assert.equal((await l.cycle(TEAM_OMA, ' Next ')).id, CYCLE_NEXT.id);
+    assert.equal((await l.cycle(TEAM_OMA, 'previous')).id, CYCLE_PREVIOUS.id);
+  });
+
+  it('resolves a cycle by its number, however the number is written', async () => {
+    const { lookups: l } = lookups();
+    for (const spec of ['10', '#10', 'Cycle 10', 'cycle10']) {
+      assert.equal((await l.cycle(TEAM_OMA, spec)).id, CYCLE_PAST.id, spec);
+    }
+  });
+
+  it('resolves a cycle by its name', async () => {
+    const { lookups: l } = lookups();
+    assert.equal((await l.cycle(TEAM_OMA, 'launch')).id, CYCLE_CURRENT.id);
+  });
+
+  it('says so when the team is between two cycles', async () => {
+    const { lookups: l } = lookups({ cycles: [CYCLE_PREVIOUS, CYCLE_NEXT] });
+    await assert.rejects(
+      () => l.cycle(TEAM_OMA, 'current'),
+      (err: unknown) =>
+        err instanceof LinearLookupError &&
+        /Team OMA has no current cycle right now\. Its cycles: Cycle 13, Cycle 11\./.test(err.message),
+    );
+  });
+
+  it('says so when the team has no cycles at all', async () => {
+    const { lookups: l } = lookups({ cycles: [] });
+    await assert.rejects(
+      () => l.cycle(TEAM_OMA, 'current'),
+      (err: unknown) =>
+        err instanceof LinearLookupError && /Team OMA has no cycles/.test(err.message),
+    );
+  });
+
+  it('refuses an unknown cycle, lists the newest first and says what it takes', async () => {
+    const { lookups: l } = lookups();
+    await assert.rejects(
+      () => l.cycle(TEAM_OMA, '99'),
+      (err: unknown) =>
+        err instanceof LinearLookupError &&
+        /no cycle matching '99'\. Its cycles: Cycle 13, Cycle 12 \(Launch\), Cycle 11, Cycle 10\. .*'current', 'next' or 'previous'/.test(
+          err.message,
+        ),
+    );
+  });
+
+  it('keeps the cycles of two teams apart', async () => {
+    const { lookups: l, mock } = lookups();
+    await l.cycle(TEAM_OMA, 'current');
+    await assert.rejects(() => l.cycle({ id: 'team-web', key: 'WEB', name: 'Website' }, 'current'));
+    assert.deepEqual(
+      mock.callsTo('cycles').map((c) => c.args[0]),
+      [TEAM_OMA.id, 'team-web'],
+    );
+  });
+});
+
+describe('cycleLabel', () => {
+  it('shows the number, and the name when the cycle has one', () => {
+    assert.equal(cycleLabel(CYCLE_PAST), 'Cycle 10');
+    assert.equal(cycleLabel(CYCLE_CURRENT), 'Cycle 12 (Launch)');
   });
 });
 

@@ -1,9 +1,12 @@
 import type {
   CreateIssueInput,
   LinearClient,
+  LinearCycle,
+  LinearDateRange,
   LinearIssue,
   LinearIssueDetail,
   LinearLabel,
+  LinearProject,
   LinearTeam,
   LinearUser,
   LinearWorkflowState,
@@ -12,8 +15,9 @@ import type {
 import { z } from 'zod';
 
 import type { CallerReader } from './caller.js';
+import { decodeCursor, encodeCursor } from './cursor.js';
 import { LinearAgentError, quoted, rateLimitRefusal } from './errors.js';
-import { createLinearLookups, type LinearLookups } from './lookup.js';
+import { createLinearLookups, cycleLabel, type LinearLookups } from './lookup.js';
 import {
   createPreparedWriteStore,
   type PreparedAddComment,
@@ -115,10 +119,19 @@ export interface ToolkitOptions {
 // ignores the strictness flag, so nothing about the published tool definition
 // changes.
 
-/** The five state types a person asks about. Linear also has `triage`, which
- *  is a per-team optional inbox rather than a stage of work: outside the
- *  editable set and outside this filter. */
-const STATE_TYPES = ['backlog', 'unstarted', 'started', 'completed', 'canceled'] as const;
+/** Linear's state types. `triage` is the inbox of a team that reviews new
+ *  issues before accepting them: an issue created without a state lands
+ *  there, so "what is waiting in triage" is a search by this type. */
+const STATE_TYPES = [
+  'triage',
+  'backlog',
+  'unstarted',
+  'started',
+  'completed',
+  'canceled',
+] as const;
+
+const LOOKUP_KINDS = ['teams', 'states', 'users', 'labels', 'projects', 'cycles'] as const;
 
 const WRITE_KINDS = ['create_issue', 'update_issue', 'add_comment'] as const;
 
@@ -136,12 +149,40 @@ const issueKeyField = z
   .max(40)
   .describe("Issue key as people write it, e.g. 'OMA-7'.");
 
-const assigneeField = z
+const personField = z
   .string()
   .trim()
   .min(1)
   .max(200)
   .describe("'me' for the API key's owner, or a person's name as it appears in Linear.");
+
+const priorityField = z
+  .number()
+  .int()
+  .min(MIN_PRIORITY)
+  .max(MAX_PRIORITY)
+  .describe('0 no priority, 1 urgent, 2 high, 3 medium, 4 low.');
+
+/**
+ * One end of a time span, in the three spellings Linear takes: a date, a
+ * timestamp, or a span counted back from the moment of the search. The last
+ * one is what lets "last week" be asked without knowing today's date. A
+ * timestamp has to name its zone: without one, which day it falls on would be
+ * anybody's guess.
+ */
+const TIME_PATTERN =
+  /^(?:\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?|-P(?:\d+[YMWD])+)$/;
+
+const TIME_FORMATS =
+  "YYYY-MM-DD (midnight UTC), a timestamp with its zone such as 2026-11-02T09:00:00Z, or a span back from now: '-P7D' is 7 days ago, '-P2W' 2 weeks, '-P1M' a month";
+
+function timeField(meaning: string): z.ZodString {
+  return z
+    .string()
+    .trim()
+    .regex(TIME_PATTERN, `Use ${TIME_FORMATS}.`)
+    .describe(`${meaning} ${TIME_FORMATS}.`);
+}
 
 const searchInput = z.object({
   teamKey: teamKeyField.optional(),
@@ -149,9 +190,37 @@ const searchInput = z.object({
     .enum(STATE_TYPES)
     .optional()
     .describe(
-      'Stage of work to filter by. completed and canceled are the two "closed" kinds.',
+      'Stage of work to filter by. completed and canceled are the two "closed" kinds; triage is ' +
+        'the inbox of new issues a team has not accepted yet.',
     ),
-  assignee: assigneeField.optional(),
+  assignee: personField.optional(),
+  creator: personField.optional(),
+  label: z
+    .string()
+    .trim()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe('Label name. Finds the issues that carry this label.'),
+  priority: priorityField.optional(),
+  project: z.string().trim().min(1).max(200).optional().describe('Project name.'),
+  cycle: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe("A cycle of the team: 'current', 'next' or 'previous', a cycle number, or a cycle name."),
+  createdAfter: timeField('Created at or after this moment.').optional(),
+  createdBefore: timeField('Created before this moment.').optional(),
+  updatedAfter: timeField('Last updated at or after this moment.').optional(),
+  updatedBefore: timeField('Last updated before this moment.').optional(),
+  completedAfter: timeField(
+    'Completed at or after this moment. Matches completed issues only, not canceled ones.',
+  ).optional(),
+  completedBefore: timeField(
+    'Completed before this moment. Matches completed issues only, not canceled ones.',
+  ).optional(),
   text: z
     .string()
     .trim()
@@ -166,14 +235,26 @@ const searchInput = z.object({
     .max(50)
     .optional()
     .describe('Maximum number of issues to return. Defaults to 25.'),
+  cursor: z
+    .string()
+    .trim()
+    .min(1)
+    .max(2_000)
+    .optional()
+    .describe(
+      'The cursor of an earlier result, to get the page after it. Repeat every other field of that call unchanged.',
+    ),
 }).strict();
 
 const getIssueInput = z.object({ key: issueKeyField }).strict();
 
 const lookupInput = z.object({
   kind: z
-    .enum(['teams', 'states', 'users', 'labels'])
-    .describe('Which set of Linear records to list.'),
+    .enum(LOOKUP_KINDS)
+    .describe(
+      'Which set of Linear records to list. states, labels and cycles are those of one team; ' +
+        'teams, users and projects those of the workspace.',
+    ),
   teamKey: teamKeyField.optional(),
   query: z
     .string()
@@ -209,9 +290,9 @@ const writeInput = z.object({
     .describe(
       "Workflow-state name, e.g. 'Done'. Closing an issue is a move to a completed or canceled state.",
     ),
-  // Not `assigneeField.optional().describe(...)`: the host's bridge unwraps an
+  // Not `personField.optional().describe(...)`: the host's bridge unwraps an
   // Optional to its inner schema and only falls back to the outer description
-  // when the inner has none. `assigneeField` already carries one, so a
+  // when the inner has none. `personField` already carries one, so a
   // re-describe after `.optional()` would be silently dropped and this field
   // would advertise the search wording instead of the write wording. Spelled
   // out with `.describe()` on the string itself. (Fields below that describe
@@ -225,13 +306,7 @@ const writeInput = z.object({
       "'me' for the API key's owner, a person's name, or 'none' to clear the assignee on update_issue.",
     )
     .optional(),
-  priority: z
-    .number()
-    .int()
-    .min(MIN_PRIORITY)
-    .max(MAX_PRIORITY)
-    .optional()
-    .describe('0 no priority, 1 urgent, 2 high, 3 medium, 4 low.'),
+  priority: priorityField.optional(),
   labels: z
     .array(z.string().trim().min(1).max(100))
     .max(20)
@@ -269,6 +344,10 @@ const MAX_COMMENTS_RETURNED = 20;
  *  the host passes on (see errors.ts). */
 const MAX_NOOP_VALUE_CHARS = 50;
 
+/** Most records `linear_lookup` returns. A lookup reads its whole collection,
+ *  and a workspace with thousands of members must not arrive in one result. */
+const MAX_LOOKUP_ROWS = 250;
+
 function summariseIssue(issue: LinearIssue): Record<string, unknown> {
   return {
     key: issue.identifier,
@@ -278,6 +357,8 @@ function summariseIssue(issue: LinearIssue): Record<string, unknown> {
     assignee: issue.assignee?.displayName ?? null,
     priority: priorityLabel(issue.priority),
     labels: issue.labels,
+    project: issue.project?.name ?? null,
+    cycle: issue.cycle === undefined ? null : cycleLabel(issue.cycle),
     updatedAt: issue.updatedAt,
     url: issue.url,
   };
@@ -321,32 +402,60 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
   const searchIssues: ToolDescriptor<unknown, unknown> = {
     id: 'linear_search_issues',
     description:
-      'Find Linear issues by team, stage of work, assignee or free text. Returns a compact summary per issue ' +
-      '(key, title, state, assignee, priority, labels, link). Cite the issue keys in your answer. Read-only.',
+      'Find Linear issues by team, stage of work, assignee, creator, label, priority, project, cycle, ' +
+      'by when they were created, last updated or completed, or by free text. Every filter given has to ' +
+      'match. Returns a compact summary per issue (key, title, state, assignee, priority, labels, project, ' +
+      'cycle, link), one page at a time: hasMore says whether more issues match than were returned. To ' +
+      'get them, call again with the same input plus the cursor of this result. Cite the issue keys in ' +
+      'your answer. Read-only.',
     input: searchInput as z.ZodType<unknown>,
     async run(raw) {
       const input = searchInput.parse(raw);
       const team = await lookups.team(input.teamKey);
-      const assignee =
-        input.assignee === undefined ? undefined : await lookups.user(input.assignee);
+      const assignee = await given(input.assignee, (name) => lookups.user(name));
+      const creator = await given(input.creator, (name) => lookups.user(name));
+      const label = await given(input.label, (name) => lookups.label(team, name));
+      const project = await given(input.project, (name) => lookups.project(name));
+      const cycle = await given(input.cycle, (spec) => lookups.cycle(team, spec));
+      const cursor = input.cursor === undefined ? undefined : requireCursor(input.cursor);
       log('linear_search_issues', {
         teamKey: team.key,
         stateType: input.stateType,
         assignee: assignee?.displayName,
         hasText: input.text !== undefined,
+        page: cursor === undefined ? 'first' : 'next',
       });
-      const issues = await client.searchIssues({
+
+      const page = await client.searchIssues({
         teamKey: team.key,
-        ...(input.stateType === undefined ? {} : { stateType: input.stateType }),
-        ...(assignee === undefined ? {} : { assigneeId: assignee.id }),
-        ...(input.text === undefined ? {} : { text: input.text }),
-        ...(input.limit === undefined ? {} : { limit: input.limit }),
+        stateType: input.stateType,
+        assigneeId: assignee?.id,
+        creatorId: creator?.id,
+        labelId: label?.id,
+        priority: input.priority,
+        projectId: project?.id,
+        cycleId: cycle?.id,
+        createdAt: timeSpan(input.createdAfter, input.createdBefore),
+        updatedAt: timeSpan(input.updatedAfter, input.updatedBefore),
+        completedAt: timeSpan(input.completedAfter, input.completedBefore),
+        text: input.text,
+        limit: input.limit,
+        cursor,
       });
+      // The person a filter resolved to goes back with the result: "me" is
+      // somebody the caller cannot know. A label, project or cycle shows in
+      // the issues themselves.
+      //
+      // `count`, `hasMore` and `cursor` are named the way the host knows the
+      // paging data of a result. Under any other name it would copy them into
+      // every issue as a column of its own.
       return {
         teamKey: team.key,
-        ...(assignee === undefined ? {} : { assignee: assignee.displayName }),
-        count: issues.length,
-        issues: issues.map(summariseIssue),
+        ...present({ assignee: assignee?.displayName, creator: creator?.displayName }),
+        count: page.issues.length,
+        hasMore: page.nextCursor !== undefined,
+        cursor: page.nextCursor === undefined ? null : encodeCursor(page.nextCursor),
+        issues: page.issues.map(summariseIssue),
       };
     },
   };
@@ -373,8 +482,10 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
   const lookup: ToolDescriptor<unknown, unknown> = {
     id: 'linear_lookup',
     description:
-      'List the Linear records a write refers to by name: teams, workflow states, workspace members or labels. ' +
-      'Use it when a name the user gave is ambiguous, or to see which states or labels a team has. Read-only.',
+      'List Linear records by name: teams, workflow states, workspace members, labels, projects or cycles. ' +
+      'Use it when a name the user gave is ambiguous, to see which states or labels a team has, which ' +
+      'projects exist, or which cycle is the current one. A list longer than 250 is cut: hasMore says so ' +
+      'and total counts them all; narrow it with query. Read-only.',
     input: lookupInput as z.ZodType<unknown>,
     async run(raw) {
       const input = lookupInput.parse(raw);
@@ -382,17 +493,12 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       switch (input.kind) {
         case 'teams': {
           const teams = filterByName(await lookups.teams(), input.query, (t) => [t.key, t.name]);
-          return { kind: input.kind, count: teams.length, teams: teams.map(teamRow) };
+          return listing(input.kind, teams, teamRow);
         }
         case 'states': {
           const team = await lookups.team(input.teamKey);
           const states = filterByName(await lookups.states(team.id), input.query, (s) => [s.name]);
-          return {
-            kind: input.kind,
-            teamKey: team.key,
-            count: states.length,
-            states: states.map(stateRow),
-          };
+          return listing(input.kind, states, stateRow, { teamKey: team.key });
         }
         case 'users': {
           const active = (await lookups.users()).filter((u) => u.active);
@@ -402,21 +508,27 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
             u.email ?? '',
           ]);
           return {
-            kind: input.kind,
-            count: matched.length,
-            users: matched.map(userRow),
+            ...listing(input.kind, matched, userRow),
             note: "Pass 'me' as an assignee to mean the API key's owner.",
           };
         }
         case 'labels': {
           const team = await lookups.team(input.teamKey);
           const labels = filterByName(await lookups.labels(team.id), input.query, (l) => [l.name]);
-          return {
-            kind: input.kind,
-            teamKey: team.key,
-            count: labels.length,
-            labels: labels.map(labelRow),
-          };
+          return listing(input.kind, labels, labelRow, { teamKey: team.key });
+        }
+        case 'projects': {
+          const projects = filterByName(await lookups.projects(), input.query, (p) => [p.name]);
+          return listing(input.kind, projects, projectRow);
+        }
+        case 'cycles': {
+          const team = await lookups.team(input.teamKey);
+          // Newest first: a team's old cycles outnumber the ones anybody asks
+          // about, and a cut list has to keep the recent end.
+          const cycles = filterByName([...(await lookups.cycles(team.id))].reverse(), input.query, (c) => [
+            cycleLabel(c),
+          ]);
+          return listing(input.kind, cycles, cycleRow, { teamKey: team.key });
         }
       }
     },
@@ -887,6 +999,58 @@ function filterByName<T>(
   return items.filter((i) => fields(i).some((f) => f.toLowerCase().includes(wanted)));
 }
 
+/** `resolve(value)`, or `undefined` for a value the caller left out. */
+async function given<T, R>(
+  value: T | undefined,
+  resolve: (value: T) => Promise<R>,
+): Promise<R | undefined> {
+  return value === undefined ? undefined : resolve(value);
+}
+
+/** The entries that carry a value. */
+function present(entries: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(entries).filter(([, value]) => value !== undefined));
+}
+
+/** The two ends of a time filter as the client takes them, or `undefined`
+ *  when neither was given. */
+function timeSpan(from: string | undefined, before: string | undefined): LinearDateRange | undefined {
+  return from === undefined && before === undefined ? undefined : { from, before };
+}
+
+/** The Linear cursor behind a `cursor` the model passed back. */
+function requireCursor(handle: string): string {
+  const cursor = decodeCursor(handle);
+  if (cursor === undefined) {
+    throw new LinearAgentError(
+      `'${quoted(handle)}' is not a cursor this tool returned. Pass the cursor exactly as an earlier ` +
+        'result gave it, or leave it out to start at the first page.',
+    );
+  }
+  return cursor;
+}
+
+/**
+ * What `linear_lookup` returns for one kind: the rows under the kind's own
+ * name, at most {@link MAX_LOOKUP_ROWS} of them, and whether that is all.
+ */
+function listing<T>(
+  kind: (typeof LOOKUP_KINDS)[number],
+  items: readonly T[],
+  row: (item: T) => Record<string, unknown>,
+  scope: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  const shown = items.slice(0, MAX_LOOKUP_ROWS);
+  return {
+    kind,
+    ...scope,
+    count: shown.length,
+    total: items.length,
+    hasMore: items.length > shown.length,
+    [kind]: shown.map(row),
+  };
+}
+
 function teamRow(team: LinearTeam): Record<string, unknown> {
   return { key: team.key, name: team.name, id: team.id };
 }
@@ -904,5 +1068,32 @@ function labelRow(label: LinearLabel): Record<string, unknown> {
     name: label.name,
     scope: label.teamId === undefined ? 'workspace' : 'team',
     id: label.id,
+  };
+}
+
+function projectRow(project: LinearProject): Record<string, unknown> {
+  return {
+    name: project.name,
+    status: project.status.name,
+    statusType: project.status.type,
+    startDate: project.startDate ?? null,
+    targetDate: project.targetDate ?? null,
+    url: project.url,
+    id: project.id,
+  };
+}
+
+function cycleRow(cycle: LinearCycle): Record<string, unknown> {
+  return {
+    number: cycle.number,
+    name: cycle.name ?? null,
+    // The phase in a word for the reader of a table, and the one that is
+    // asked for most as a flag as well: a flag stays readable where the host
+    // masks every word.
+    phase: cycle.phase,
+    current: cycle.phase === 'current',
+    startsAt: cycle.startsAt,
+    endsAt: cycle.endsAt,
+    id: cycle.id,
   };
 }

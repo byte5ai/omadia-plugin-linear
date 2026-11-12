@@ -104,7 +104,7 @@ describe('manifest.yaml <-> code', () => {
   });
 
   it('requires the Linear API capability, and not as an optional', () => {
-    assert.deepEqual(listItems('requires'), [`${LINEAR_API_SERVICE_NAME}@^1`]);
+    assert.deepEqual(listItems('requires'), [`${LINEAR_API_SERVICE_NAME}@^2`]);
     assert.ok(
       !listItems('optional_requires').some((c) => c.startsWith(LINEAR_API_SERVICE_NAME)),
       'optional_requires would let this agent activate without a Linear connection',
@@ -297,6 +297,9 @@ describe('prompt partial', () => {
       'Issue',
       'Workflow state',
       'Lookup',
+      'Project',
+      'Cycle',
+      'Triage',
       'Prepared write',
       'Preview',
       'Commit',
@@ -323,6 +326,8 @@ describe('prompt partial', () => {
       ['Issue', 'Aufgabe'],
       ['Workflow state', 'Status'],
       ['Default team', 'Standard-Team'],
+      ['Project', 'Projekt'],
+      ['Cycle', 'Zyklus'],
       ['Prepared write', 'vorbereitete Änderung'],
       ['Preview', 'Vorschau'],
       ['Commit', 'übernehmen'],
@@ -340,6 +345,19 @@ describe('prompt partial', () => {
     // The preview is what the user agrees to, so a readable one is quoted as
     // returned, whatever the language of the answer.
     assert.match(skill, /quoted as returned:\n\n> OMA-7: Todo → Done, assignee unchanged/);
+  });
+
+  it('says how to find issues by filter, by time and page by page', () => {
+    assert.match(skill, /^## Finding issues$/m);
+    assert.match(skill, /an issue has to match every filter\s+you pass/);
+    // A span back from now is how "last week" is asked without today's date.
+    assert.match(skill, /`-P7D` is seven\s+days ago/);
+    assert.match(skill, /`current`, `next` or `previous`, a cycle number, or a cycle\s+name/);
+    assert.match(skill, /`stateType: triage`/);
+    assert.match(skill, /`stateType: canceled` and `updatedAfter`/);
+    // What a page is, and what the model does about the rest.
+    assert.match(skill, /`hasMore: true` says that more issues match than you\s+got/);
+    assert.match(skill, /the same input plus that\s+`cursor`/);
   });
 
   it('names the default team as configuration, not a hardcoded key', () => {

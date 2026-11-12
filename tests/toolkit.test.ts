@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
+import { decodeCursor } from '../src/cursor.js';
 import { LinearAgentError } from '../src/errors.js';
 import { createPreparedWriteStore } from '../src/preparedWrites.js';
 import { createToolkit, type Toolkit, type WriteMode } from '../src/toolkit.js';
@@ -9,9 +10,12 @@ import {
   createLog,
   createMockLinear,
   createTurns,
+  CYCLE_CURRENT,
+  LABEL_BUG,
   LABEL_MOBILE,
   makeComment,
   makeIssue,
+  PROJECT_BILLING,
   STATE_DONE,
   STATE_DONE_DEPLOY,
   STATE_TODO,
@@ -232,14 +236,91 @@ describe('toolkit shape', () => {
     assert.deepEqual(required.get('linear_commit_write'), []);
   });
 
-  it('offers the five stages of work as an enum, and not triage', () => {
+  it('offers every state type Linear has as an enum, triage included', () => {
     const tool = toolkit.tools.find((t) => t.id === 'linear_search_issues');
     assert.ok(tool);
-    const parsed = tool.input.safeParse({ stateType: 'triage' });
-    assert.equal(parsed.success, false);
-    for (const t of ['backlog', 'unstarted', 'started', 'completed', 'canceled']) {
+    for (const t of ['triage', 'backlog', 'unstarted', 'started', 'completed', 'canceled']) {
       assert.ok(tool.input.safeParse({ stateType: t }).success, `${t} should be accepted`);
     }
+    assert.equal(tool.input.safeParse({ stateType: 'done' }).success, false);
+  });
+
+  it('takes a time as a date, a timestamp with its zone, or a span back from now', () => {
+    const tool = toolkit.tools.find((t) => t.id === 'linear_search_issues');
+    assert.ok(tool);
+    const fields = [
+      'createdAfter',
+      'createdBefore',
+      'updatedAfter',
+      'updatedBefore',
+      'completedAfter',
+      'completedBefore',
+    ];
+    for (const field of fields) {
+      for (const ok of [
+        '2026-11-02',
+        '2026-11-02T09:00:00Z',
+        '2026-11-02T09:00:00.000Z',
+        '2026-11-02T09:00+01:00',
+        '-P7D',
+        '-P2W',
+        '-P1M',
+        '-P2W1D',
+      ]) {
+        assert.ok(tool.input.safeParse({ [field]: ok }).success, `${field}: ${ok} should be accepted`);
+      }
+      for (const bad of [
+        'last week',
+        'yesterday',
+        '02.11.2026',
+        '2026-11-02T09:00:00', // which zone?
+        'P7D', // a span forward
+        '-P',
+        '-7D',
+        '',
+      ]) {
+        assert.equal(
+          tool.input.safeParse({ [field]: bad }).success,
+          false,
+          `${field}: '${bad}' should be rejected`,
+        );
+      }
+    }
+    // What the model is told when it gets the format wrong names the formats.
+    const issue = tool.input.safeParse({ completedAfter: 'last week' }).error?.issues[0];
+    assert.match(issue?.message ?? '', /YYYY-MM-DD.*-P7D/);
+  });
+
+  it('describes every search field the bridge will publish', () => {
+    const tool = toolkit.tools.find((t) => t.id === 'linear_search_issues');
+    assert.ok(tool);
+    const shape = defOf(tool.input).shape as Record<string, unknown>;
+    for (const [key, field] of Object.entries(shape)) {
+      // The bridge publishes the inner description of an Optional and falls
+      // back to the outer one.
+      const inner = defOf(field).innerType as { description?: string } | undefined;
+      const description = inner?.description ?? (field as { description?: string }).description;
+      assert.ok((description ?? '').length > 10, `${key} needs a description`);
+    }
+    assert.deepEqual(Object.keys(shape).sort(), [
+      'assignee',
+      'completedAfter',
+      'completedBefore',
+      'createdAfter',
+      'createdBefore',
+      'creator',
+      'cursor',
+      'cycle',
+      'label',
+      'limit',
+      'priority',
+      'project',
+      'stateType',
+      'teamKey',
+      'text',
+      'updatedAfter',
+      'updatedBefore',
+    ]);
   });
 
   it('rejects an undeclared key instead of dropping it', () => {
@@ -350,9 +431,11 @@ describe('linear_search_issues', () => {
     assert.equal(out['count'], 1);
     assert.deepEqual(Object.keys(issues[0] ?? {}).sort(), [
       'assignee',
+      'cycle',
       'key',
       'labels',
       'priority',
+      'project',
       'state',
       'stateType',
       'title',
@@ -371,6 +454,149 @@ describe('linear_search_issues', () => {
       /No team with key 'NOPE'.*OMA, WEB/s,
     );
   });
+
+  it('resolves every name filter to the id Linear filters by', async () => {
+    const { toolkit, mock } = setup();
+    const out = await run(toolkit, 'linear_search_issues', {
+      stateType: 'triage',
+      creator: 'Kim Lee',
+      label: 'Bug',
+      priority: 1,
+      project: 'billing',
+      cycle: 'current',
+    });
+
+    assert.deepEqual(mock.callsTo('searchIssues')[0]?.args[0], {
+      teamKey: 'OMA',
+      stateType: 'triage',
+      creatorId: USER_KIM_LEE.id,
+      labelId: LABEL_BUG.id,
+      priority: 1,
+      projectId: PROJECT_BILLING.id,
+      cycleId: CYCLE_CURRENT.id,
+    });
+    // The person a filter resolved to goes back with the result.
+    assert.equal(out['creator'], USER_KIM_LEE.displayName);
+  });
+
+  it('carries the paging data under the names the host keeps out of the rows', async () => {
+    // The host takes `count`, `hasMore` and `cursor` for the paging data of a
+    // result. Any other top-level value it copies into every issue row.
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_search_issues', { label: 'bug', cycle: 'current' });
+    assert.deepEqual(Object.keys(out).sort(), ['count', 'cursor', 'hasMore', 'issues', 'teamKey']);
+  });
+
+  it('filters by priority 0, which is a value and not an absence', async () => {
+    const { toolkit, mock } = setup();
+    await run(toolkit, 'linear_search_issues', { priority: 0 });
+    assert.deepEqual(mock.callsTo('searchIssues')[0]?.args[0], { teamKey: 'OMA', priority: 0 });
+  });
+
+  it('passes each time span on as its two ends', async () => {
+    const { toolkit, mock } = setup();
+    await run(toolkit, 'linear_search_issues', {
+      createdAfter: '2026-11-02',
+      createdBefore: '2026-11-09',
+      updatedAfter: '-P7D',
+      completedBefore: '2026-11-09T12:00:00Z',
+    });
+    assert.deepEqual(mock.callsTo('searchIssues')[0]?.args[0], {
+      teamKey: 'OMA',
+      createdAt: { from: '2026-11-02', before: '2026-11-09' },
+      updatedAt: { from: '-P7D' },
+      completedAt: { before: '2026-11-09T12:00:00Z' },
+    });
+  });
+
+  it('refuses an unknown label, project or cycle by listing what exists', async () => {
+    const { toolkit, mock } = setup();
+    await rejects(
+      run(toolkit, 'linear_search_issues', { label: 'urgent' }),
+      /no label matching 'urgent'.*bug, mobile, needs-triage/s,
+    );
+    await rejects(
+      run(toolkit, 'linear_search_issues', { project: 'Roadmap' }),
+      /No project matches 'Roadmap'\. Projects: Mobile app, Mobile app v2, Billing\./,
+    );
+    await rejects(
+      run(toolkit, 'linear_search_issues', { cycle: '99' }),
+      /no cycle matching '99'\. Its cycles: Cycle 13, Cycle 12 \(Launch\)/,
+    );
+    assert.equal(mock.callsTo('searchIssues').length, 0, 'nothing may be searched on a bad name');
+  });
+
+  it('looks a cycle up in the team the search names', async () => {
+    const { toolkit, mock } = setup();
+    await rejects(
+      run(toolkit, 'linear_search_issues', { teamKey: 'WEB', cycle: 'current' }),
+      /Team WEB has no cycles/,
+    );
+    assert.deepEqual(mock.callsTo('cycles')[0]?.args, ['team-web']);
+  });
+
+  it('says that a page is the last one', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_search_issues', {});
+    assert.equal(out['hasMore'], false);
+    assert.equal(out['cursor'], null);
+  });
+
+  it('says that more issues match, and hands out the cursor to get them', async () => {
+    const { toolkit } = setup({ searchNextCursor: '9b1c7f0e-52a4-4c1d-8e55-0a1b2c3d4e5f' });
+    const out = await run(toolkit, 'linear_search_issues', { limit: 1 });
+    assert.equal(out['count'], 1);
+    assert.equal(out['hasMore'], true);
+    assert.equal(
+      decodeCursor(String(out['cursor'])),
+      '9b1c7f0e-52a4-4c1d-8e55-0a1b2c3d4e5f',
+    );
+  });
+
+  it('fetches the next page with the cursor it handed out', async () => {
+    const { toolkit, mock } = setup({ searchNextCursor: 'cursor-of-page-2' });
+    const first = await run(toolkit, 'linear_search_issues', { stateType: 'started', limit: 1 });
+    await run(toolkit, 'linear_search_issues', {
+      stateType: 'started',
+      limit: 1,
+      cursor: first['cursor'],
+    });
+
+    assert.deepEqual(mock.callsTo('searchIssues')[1]?.args[0], {
+      teamKey: 'OMA',
+      stateType: 'started',
+      limit: 1,
+      cursor: 'cursor-of-page-2',
+    });
+  });
+
+  it('hands out a cursor that reads as an identifier, whatever Linear sent', async () => {
+    // A host that masks tool results lets a model read a string only when it
+    // looks like an identifier. Linear promises no shape for its cursors.
+    const { toolkit } = setup({ searchNextCursor: 'eyJvZmZzZXQiOjUwfQ==' });
+    const out = await run(toolkit, 'linear_search_issues', {});
+    assert.match(String(out['cursor']), /^p1-[a-z]+$/);
+  });
+
+  it('refuses a cursor it did not hand out, and searches nothing', async () => {
+    const { toolkit, mock } = setup();
+    await rejects(
+      run(toolkit, 'linear_search_issues', { cursor: '9b1c7f0e-52a4-4c1d-8e55-0a1b2c3d4e5f' }),
+      /is not a cursor this tool returned.*leave it out to start at the first page/s,
+    );
+    assert.equal(mock.callsTo('searchIssues').length, 0);
+  });
+
+  it('tells the model in its description what hasMore asks of it', () => {
+    const { toolkit } = setup();
+    const tool = toolkit.tools.find((t) => t.id === 'linear_search_issues');
+    assert.ok(tool);
+    assert.match(tool.description, /hasMore says whether more issues match than were returned/);
+    assert.match(tool.description, /same input plus the cursor of this result/);
+    for (const filter of ['creator', 'label', 'priority', 'project', 'cycle', 'created', 'updated', 'completed']) {
+      assert.ok(tool.description.includes(filter), `the description must name the filter: ${filter}`);
+    }
+  });
 });
 
 describe('linear_get_issue', () => {
@@ -384,6 +610,39 @@ describe('linear_get_issue', () => {
     assert.equal(out['description'], 'Safari 17 rejects the session cookie.');
     assert.equal(out['commentCount'], 2);
     assert.equal((out['comments'] as unknown[]).length, 2);
+  });
+
+  it('shows the project and the cycle of an issue that has them', async () => {
+    const { toolkit } = setup({
+      issues: [
+        makeIssue({
+          project: { id: PROJECT_BILLING.id, name: PROJECT_BILLING.name },
+          cycle: { id: CYCLE_CURRENT.id, number: 12, name: 'Launch' },
+        }),
+      ],
+    });
+    const out = await run(toolkit, 'linear_get_issue', { key: 'OMA-7' });
+    assert.equal(out['project'], 'Billing');
+    assert.equal(out['cycle'], 'Cycle 12 (Launch)');
+
+    const hit = ((await run(toolkit, 'linear_search_issues', {}))['issues'] as Record<string, unknown>[])[0];
+    assert.equal(hit?.['project'], 'Billing');
+    assert.equal(hit?.['cycle'], 'Cycle 12 (Launch)');
+  });
+
+  it('shows neither for an issue that has none', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_get_issue', { key: 'OMA-7' });
+    assert.equal(out['project'], null);
+    assert.equal(out['cycle'], null);
+  });
+
+  it('shows a cycle without a name by its number', async () => {
+    const { toolkit } = setup({
+      issues: [makeIssue({ cycle: { id: 'cycle-10', number: 10, name: undefined } })],
+    });
+    const out = await run(toolkit, 'linear_get_issue', { key: 'OMA-7' });
+    assert.equal(out['cycle'], 'Cycle 10');
   });
 
   it('truncates a very long description instead of filling the context', async () => {
@@ -481,6 +740,123 @@ describe('linear_lookup', () => {
     const { toolkit } = setup();
     const out = await run(toolkit, 'linear_lookup', { kind: 'states', query: 'do' });
     assert.deepEqual((out['states'] as { name: string }[]).map((s) => s.name), ['Todo', 'Done']);
+  });
+
+  it('lists a triage state with its type', async () => {
+    const { toolkit } = setup({
+      states: [
+        { id: 'state-triage', name: 'Triage', type: 'triage', position: -1, teamId: TEAM_OMA.id },
+        STATE_TODO,
+      ],
+    });
+    const out = await run(toolkit, 'linear_lookup', { kind: 'states' });
+    const states = out['states'] as { name: string; type: string }[];
+    assert.equal(states.find((s) => s.name === 'Triage')?.type, 'triage');
+  });
+
+  it('lists the projects of the workspace with status and dates', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_lookup', { kind: 'projects' });
+    assert.ok(!('teamKey' in out), 'a project belongs to no single team');
+    assert.equal(out['count'], 3);
+    assert.deepEqual((out['projects'] as Record<string, unknown>[])[0], {
+      name: 'Mobile app',
+      status: 'In Progress',
+      statusType: 'started',
+      startDate: '2026-10-01',
+      targetDate: '2026-12-15',
+      url: 'https://linear.app/omadia-dev/project/mobile-app',
+      id: 'project-mobile',
+    });
+    // No date is a null, so every row has the same columns.
+    assert.equal((out['projects'] as Record<string, unknown>[])[1]?.['targetDate'], null);
+  });
+
+  it('narrows projects by the query', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_lookup', { kind: 'projects', query: 'mobile' });
+    assert.deepEqual(
+      (out['projects'] as { name: string }[]).map((p) => p.name),
+      ['Mobile app', 'Mobile app v2'],
+    );
+  });
+
+  it('lists the cycles of the team, newest first, and marks the current one', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_lookup', { kind: 'cycles' });
+    assert.equal(out['teamKey'], 'OMA');
+    const cycles = out['cycles'] as Record<string, unknown>[];
+    assert.deepEqual(
+      cycles.map((c) => [c['number'], c['phase'], c['current']]),
+      [
+        [13, 'next', false],
+        [12, 'current', true],
+        [11, 'previous', false],
+        [10, 'past', false],
+      ],
+    );
+    assert.deepEqual(cycles[1], {
+      number: 12,
+      name: 'Launch',
+      phase: 'current',
+      current: true,
+      startsAt: '2026-11-09T00:00:00.000Z',
+      endsAt: '2026-11-23T00:00:00.000Z',
+      id: 'cycle-12',
+    });
+    assert.equal(cycles[0]?.['name'], null);
+  });
+
+  it('lists no cycles for a team that has none', async () => {
+    const { toolkit } = setup();
+    const out = await run(toolkit, 'linear_lookup', { kind: 'cycles', teamKey: 'WEB' });
+    assert.equal(out['count'], 0);
+    assert.deepEqual(out['cycles'], []);
+  });
+
+  it('says that a list is complete', async () => {
+    const { toolkit } = setup();
+    for (const kind of ['teams', 'states', 'users', 'labels', 'projects', 'cycles']) {
+      const out = await run(toolkit, 'linear_lookup', { kind });
+      assert.equal(out['hasMore'], false, kind);
+      assert.equal(out['total'], out['count'], kind);
+    }
+  });
+
+  it('cuts a list longer than 250, and says how many there are', async () => {
+    const labels = Array.from({ length: 612 }, (_, n) => ({
+      id: `label-${String(n)}`,
+      name: `area-${String(n)}`,
+      teamId: TEAM_OMA.id,
+    }));
+    const { toolkit } = setup({ labels });
+
+    const out = await run(toolkit, 'linear_lookup', { kind: 'labels' });
+    assert.equal((out['labels'] as unknown[]).length, 250);
+    assert.equal(out['count'], 250);
+    assert.equal(out['total'], 612);
+    assert.equal(out['hasMore'], true);
+
+    // The query narrows before the cut, so a record past it stays reachable.
+    const narrowed = await run(toolkit, 'linear_lookup', { kind: 'labels', query: 'area-611' });
+    assert.deepEqual((narrowed['labels'] as { name: string }[]).map((l) => l.name), ['area-611']);
+    assert.equal(narrowed['hasMore'], false);
+  });
+
+  it('resolves a name past the cut all the same', async () => {
+    // The cut is on what the lookup tool lists, not on what a name resolves
+    // against.
+    const labels = Array.from({ length: 612 }, (_, n) => ({
+      id: `label-${String(n)}`,
+      name: `area-${String(n)}`,
+      teamId: TEAM_OMA.id,
+    }));
+    const { toolkit, mock } = setup({ labels });
+    await run(toolkit, 'linear_search_issues', { label: 'area-611' });
+    assert.deepEqual(mock.callsTo('searchIssues')[0]?.args[0], {
+      teamKey: 'OMA',
+      labelId: 'label-611',
+    });
   });
 });
 

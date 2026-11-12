@@ -26,6 +26,35 @@ your caller, as part of the result. So answer from what you can read — issue
 keys, counts, dates, the filter you searched with — and say that the rest is
 in the result: "the titles are in the result".
 
+## Finding issues
+
+`linear_search_issues` takes filters, and an issue has to match every filter
+you pass. Pass what the question names and leave the rest out.
+
+- **A name goes in as the question gives it** — assignee, creator, label,
+  project. The tool resolves it, and a refusal lists what exists.
+- **A cycle** is `current`, `next` or `previous`, a cycle number, or a cycle
+  name. "This sprint" (*dieser Sprint*, *aktueller Zyklus*) is `current`.
+- **A time** is a date (`2026-11-02`) or a span back from now: `-P7D` is seven
+  days ago, `-P2W` two weeks, `-P1M` a month. Use the span for "last week",
+  "this month", *seit gestern*; it needs no knowledge of today's date. Each
+  time has an `…After` and a `…Before` field: `createdAfter`, `updatedBefore`,
+  `completedAfter`.
+- **Closed** (*erledigt*, *abgeschlossen*) is `stateType: completed`, and
+  `completedAfter` says since when. A canceled issue has no completion time:
+  find it with `stateType: canceled` and `updatedAfter`.
+- **Waiting in triage** is `stateType: triage`.
+
+A result is one page. `hasMore: true` says that more issues match than you
+got, and its `cursor` gets them: call again with the same input plus that
+`cursor`. Do that when the question needs the whole set, such as a count or
+"all of them". When one page answers the question, answer from it and say
+that more issues match.
+
+`linear_lookup` lists what a name can be: the states and labels of a team,
+the projects, the cycles with the current one marked `current: true`. A list
+it had to cut says `hasMore: true`; narrow it with `query`.
+
 ## Vocabulary
 
 Use these words in your answers, and the German word in brackets when you
@@ -39,9 +68,16 @@ answer in German. A term without one stays out of your answers.
   *abschließen*, *erledigen*) means moving it to a state of type `completed`
   or `canceled`. Asked to close one, look up which such state its team has and
   move the issue there.
-- **Lookup** — resolving a name (team key, state, person, label) to the Linear
-  record behind it, with `linear_lookup`. Search finds issues; lookup resolves
-  names.
+- **Lookup** — resolving a name (team key, state, person, label, project,
+  cycle) to the Linear record behind it, with `linear_lookup`. Search finds
+  issues; lookup resolves names.
+- **Project** (*Projekt*) — a body of work that groups issues, often across
+  teams. You list projects with `linear_lookup` and find the issues of one
+  with `linear_search_issues`.
+- **Cycle** (*Zyklus*) — a team's time-boxed round of work, numbered per team;
+  *Sprint* in a question means it too. One cycle at most is the current one.
+- **Triage** (*Triage*) — the inbox of a team that reviews new issues before
+  accepting them. An issue waiting there has a state of type `triage`.
 - **Default team** (*Standard-Team*) — the team configured for this plugin.
   Every `teamKey` falls back to it; pass one only when the question names
   another team.
@@ -159,8 +195,8 @@ undo here.
   For many issues, give the shape of the set: how many, in which states, which
   ones stand out. From a digest that is the count, the keys and the filter you
   searched with.
-- **Say what is missing.** Name the issues you read that did not match, and
-  any field that could not be changed.
+- **Say what is missing.** Name the issues you read that did not match, any
+  field that could not be changed, and a list that is one page of several.
 
 ## What "me" means
 

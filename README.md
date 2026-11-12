@@ -7,7 +7,7 @@ and applied only after the user confirms it; the operator can switch the
 confirmation off, or switch changes off altogether.
 
 It holds no credential. Linear is reached through the **Linear API capability**
-(`linear.api@1`) published by [`@omadia/integration-linear`](../omadia-integration-linear),
+(`linear.api@2`) published by [`@omadia/integration-linear`](../omadia-integration-linear),
 which owns the personal API key and the `api.linear.app` egress allow-list. The
 client contract is that package's `INTEGRATION.md`; read it before changing
 anything here.
@@ -15,7 +15,7 @@ anything here.
 ```
 @omadia/integration-linear          @omadia/agent-linear
   linear_api_key (secret)             default_team_key, linear_write_mode
-  provides: linear.api@1      <────   requires: linear.api@^1
+  provides: linear.api@2      <────   requires: linear.api@^2
   egress: api.linear.app              egress: none
 ```
 
@@ -47,16 +47,51 @@ plugin id. The tools below are the sub-agent's, not the orchestrator's.
 
 | Tool | Write mode | What it does |
 |---|---|---|
-| `linear_search_issues` | all | Issues by team, stage of work, assignee or free text. Returns one compact summary per issue. |
+| `linear_search_issues` | all | Issues by team, stage of work (triage included), assignee, creator, label, priority, project, cycle, time of creation, last update or completion, or free text. Returns one compact summary per issue, one page at a time, and says whether more match. |
 | `linear_get_issue` | all | One issue by key, with its description and most recent comments. |
-| `linear_lookup` | all | Teams, workflow states, workspace members or labels — the records a write refers to by name. |
+| `linear_lookup` | all | Teams, workflow states, workspace members, labels, projects or cycles — the records a search or a write refers to by name. Marks the current cycle. |
 | `linear_prepare_write` | `confirm` | Validates and stages a change, returns a preview and its expiry. **Writes nothing.** |
 | `linear_commit_write` | `confirm` | Applies the change staged in the calling conversation. |
 | `linear_write` | `direct` | Validates a change and applies it at once. |
 
 Editable: state, assignee, priority, title, description, labels. Not editable:
-project, cycle, estimate, parent. There is no delete and no archive; "closing"
+project, cycle, estimate, parent — an issue's project and cycle are shown and
+can be searched by, not changed. There is no delete and no archive; "closing"
 an issue is a move to a state whose type is `completed` or `canceled`.
+
+## Finding issues
+
+`linear_search_issues` takes flat, optional filters, and every one given has
+to match:
+
+| Filter | Takes |
+|---|---|
+| `teamKey` | A team key. Defaults to the configured team. |
+| `stateType` | `triage`, `backlog`, `unstarted`, `started`, `completed`, `canceled`. |
+| `assignee`, `creator` | `me` (the API key's owner) or a person's name. |
+| `label`, `project` | A name. |
+| `cycle` | `current`, `next` or `previous`, a cycle number, or a cycle name. |
+| `priority` | 0 to 4. |
+| `createdAfter` / `createdBefore`, `updatedAfter` / `updatedBefore`, `completedAfter` / `completedBefore` | A date (`2026-11-02`), a timestamp with its zone, or a span back from now (`-P7D`, `-P2W`, `-P1M`). |
+| `text` | Full-text search over title and description. |
+
+A name resolves the way it does for a write: an unknown or ambiguous label,
+project, cycle or person is a refusal that lists the candidates. The span
+back from now is what lets a model ask for "last week" without knowing
+today's date; Linear resolves it when the search runs.
+
+A result is one page (`limit`, at most 50) and says so: `hasMore` is true
+when more issues match, and `cursor` fetches them when passed back with the
+same filters. The cursor the model sees is Linear's, re-spelled
+(`src/cursor.ts`): a host that masks tool results lets a model read a string
+only when it looks like an identifier, and Linear promises no shape for its
+cursors. `count`, `hasMore` and `cursor` are the names the host knows as the
+paging data of a result; under another name it would copy them into every
+issue row.
+
+`linear_lookup` reads a collection to its end, so a name on a later page
+resolves like one on the first. What it lists is cut at 250 records, with
+`hasMore` and `total` saying so; `query` narrows before the cut.
 
 ## The write gate
 

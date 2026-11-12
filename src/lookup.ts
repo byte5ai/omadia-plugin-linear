@@ -1,6 +1,10 @@
 import type {
   LinearClient,
+  LinearCycle,
+  LinearCyclePhase,
+  LinearCycleRef,
   LinearLabel,
+  LinearProject,
   LinearTeam,
   LinearUser,
   LinearWorkflowState,
@@ -11,10 +15,11 @@ import { LinearAgentError, quoted } from './errors.js';
 /**
  * Lookup: turning a human name into the Linear id the API needs.
  *
- * Linear's write API speaks ids; people speak names ("move OMA-7 to Done and
- * give it to Kim"). Everything that turns the second into the first lives here,
- * so `prepare_write` reads as validate-then-stage and the lookup rules sit in
- * one place with one wording for their failure messages.
+ * Linear's API speaks ids; people speak names ("move OMA-7 to Done and give it
+ * to Kim", "the bugs in the current cycle"). Everything that turns the second
+ * into the first lives here, so a write reads as validate-then-stage, a search
+ * as resolve-then-filter, and the lookup rules sit in one place with one
+ * wording for their failure messages.
  *
  * Two decisions shape this file:
  *
@@ -31,10 +36,11 @@ import { LinearAgentError, quoted } from './errors.js';
  *     already known.
  */
 
-/** Teams, states, users and labels change on the scale of weeks. Five minutes
- *  is short enough that a state renamed mid-conversation resolves correctly
- *  after one turn, and long enough to collapse the lookups of a single
- *  prepare/commit exchange into one round of requests. */
+/** Teams, states, users, labels, projects and cycles change on the scale of
+ *  weeks. Five minutes is short enough that a state renamed mid-conversation
+ *  resolves correctly after one turn, and that a cycle which just ended stops
+ *  being the current one soon after; long enough to collapse the lookups of a
+ *  single prepare/commit exchange into one round of requests. */
 export const LOOKUP_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /** A name the caller gave matched no Linear record, or more than one. Carries
@@ -61,13 +67,24 @@ export interface LinearLookups {
   labels(teamId: string): Promise<readonly LinearLabel[]>;
   /** Every workspace member, active or not. Callers narrow in process. */
   users(): Promise<readonly LinearUser[]>;
+  /** Every project of the workspace. A project belongs to no single team. */
+  projects(): Promise<readonly LinearProject[]>;
+  /** The cycles of one team, ordered by number. */
+  cycles(teamId: string): Promise<readonly LinearCycle[]>;
   /** Resolve a workflow-state name within one team. */
   state(team: LinearTeam, name: string): Promise<LinearWorkflowState>;
   /** Resolve `"me"` (the key's owner) or a person's name to one user. */
   user(spec: string): Promise<LinearUser>;
+  /** Resolve one label name within one team. */
+  label(team: LinearTeam, name: string): Promise<LinearLabel>;
   /** Resolve label names within one team, preserving the caller's order and
    *  dropping repeats. */
   labelSet(team: LinearTeam, names: readonly string[]): Promise<readonly LinearLabel[]>;
+  /** Resolve a project name. */
+  project(name: string): Promise<LinearProject>;
+  /** Resolve `"current"`, `"next"` or `"previous"`, a cycle number or a cycle
+   *  name within one team. */
+  cycle(team: LinearTeam, spec: string): Promise<LinearCycle>;
   /** Drop every cached lookup. */
   invalidate(): void;
 }
@@ -100,6 +117,14 @@ export function createLinearLookups(opts: LinearLookupsOptions): LinearLookups {
     // turns "who is Kim?" followed by "who is Sam?" into two full fetches and a
     // miss into a third. One entry, filtered here.
     return cache.get('users', () => client.users());
+  }
+
+  async function projects(): Promise<readonly LinearProject[]> {
+    return cache.get('projects', () => client.projects());
+  }
+
+  async function cycles(teamId: string): Promise<readonly LinearCycle[]> {
+    return cache.get(`cycles:${teamId}`, () => client.cycles(teamId));
   }
 
   async function team(teamKey?: string): Promise<LinearTeam> {
@@ -157,36 +182,83 @@ export function createLinearLookups(opts: LinearLookupsOptions): LinearLookups {
     );
   }
 
+  async function label(t: LinearTeam, name: string): Promise<LinearLabel> {
+    const all = await labels(t.id);
+    const match = matchByName(all, name, (l) => [l.name]);
+    if (match.length === 1) return match[0] as LinearLabel;
+    if (match.length === 0) {
+      throw new LinearLookupError(
+        `Team ${t.key} has no label matching '${quoted(name)}'. Available labels: ${listOf(all.map((l) => l.name))}.`,
+      );
+    }
+    throw new LinearLookupError(
+      `'${quoted(name)}' matches several labels: ${listOf(match.map((l) => l.name))}. Use the exact name.`,
+    );
+  }
+
   async function labelSet(
     t: LinearTeam,
     names: readonly string[],
   ): Promise<readonly LinearLabel[]> {
-    const all = await labels(t.id);
-    const resolved: LinearLabel[] = [];
-    const seen = new Set<string>();
+    // A label set is a set. Two spellings of the same label ("bug", "Bug")
+    // resolve to one record, and keeping both would make the resolved list
+    // longer than the issue's own — so the label set would compare as
+    // changed forever, and the duplicate id would go out on the wire.
+    const resolved = new Map<string, LinearLabel>();
     for (const name of names) {
-      const match = matchByName(all, name, (l) => [l.name]);
-      if (match.length === 1) {
-        const label = match[0] as LinearLabel;
-        // A label set is a set. Two spellings of the same label ("bug", "Bug")
-        // resolve to one record, and keeping both would make the resolved list
-        // longer than the issue's own — so the label set would compare as
-        // changed forever, and the duplicate id would go out on the wire.
-        if (seen.has(label.id)) continue;
-        seen.add(label.id);
-        resolved.push(label);
-        continue;
-      }
-      if (match.length === 0) {
-        throw new LinearLookupError(
-          `Team ${t.key} has no label matching '${quoted(name)}'. Available labels: ${listOf(all.map((l) => l.name))}.`,
-        );
-      }
+      const hit = await label(t, name);
+      if (!resolved.has(hit.id)) resolved.set(hit.id, hit);
+    }
+    return [...resolved.values()];
+  }
+
+  async function project(name: string): Promise<LinearProject> {
+    const all = await projects();
+    const match = matchByName(all, name, (p) => [p.name]);
+    if (match.length === 1) return match[0] as LinearProject;
+    if (match.length === 0) {
       throw new LinearLookupError(
-        `'${quoted(name)}' matches several labels: ${listOf(match.map((l) => l.name))}. Use the exact name.`,
+        `No project matches '${quoted(name)}'. Projects: ${listOf(all.map((p) => p.name))}.`,
       );
     }
-    return resolved;
+    throw new LinearLookupError(
+      `'${quoted(name)}' matches several projects: ${listOf(match.map((p) => p.name))}. Use the exact name.`,
+    );
+  }
+
+  async function cycle(t: LinearTeam, spec: string): Promise<LinearCycle> {
+    const all = await cycles(t.id);
+    // Newest first: a team's old cycles outnumber the ones anybody asks
+    // about, and a shortened list has to keep the recent end.
+    const known = listOf([...all].reverse().map(cycleLabel));
+    const wanted = spec.trim();
+
+    const phase = CYCLE_KEYWORDS.get(wanted.toLowerCase());
+    if (phase !== undefined) {
+      const hit = all.find((c) => c.phase === phase);
+      if (hit) return hit;
+      throw new LinearLookupError(
+        all.length === 0
+          ? `Team ${t.key} has no cycles, so there is no ${phase} one.`
+          : `Team ${t.key} has no ${phase} cycle right now. Its cycles: ${known}.`,
+      );
+    }
+
+    const number = CYCLE_NUMBER.exec(wanted)?.[1];
+    const match =
+      number === undefined
+        ? matchByName(all, wanted, (c) => [c.name ?? ''])
+        : all.filter((c) => c.number === Number(number));
+    if (match.length === 1) return match[0] as LinearCycle;
+    if (match.length === 0) {
+      throw new LinearLookupError(
+        `Team ${t.key} has no cycle matching '${quoted(wanted)}'. Its cycles: ${known}. ` +
+          "Pass a cycle number, a cycle name, or 'current', 'next' or 'previous'.",
+      );
+    }
+    throw new LinearLookupError(
+      `'${quoted(wanted)}' matches several cycles in team ${t.key}: ${listOf(match.map(cycleLabel))}. Use the cycle number.`,
+    );
   }
 
   return {
@@ -197,11 +269,36 @@ export function createLinearLookups(opts: LinearLookupsOptions): LinearLookups {
     states,
     labels,
     users,
+    projects,
+    cycles,
     state,
     user,
+    label,
     labelSet,
+    project,
+    cycle,
     invalidate: () => cache.clear(),
   };
+}
+
+/** The words that name a cycle by where it stands today. */
+const CYCLE_KEYWORDS: ReadonlyMap<string, LinearCyclePhase> = new Map([
+  ['current', 'current'],
+  ['next', 'next'],
+  ['previous', 'previous'],
+]);
+
+/** A cycle given by its number: `12`, `#12` or `Cycle 12`. */
+const CYCLE_NUMBER = /^(?:cycle\s*)?#?(\d+)$/i;
+
+/**
+ * A cycle as a person reads it. The number always shows, because it is what
+ * tells two cycles apart and what a search takes; the name follows when the
+ * team gave the cycle one.
+ */
+export function cycleLabel(cycle: LinearCycleRef): string {
+  const numbered = `Cycle ${String(cycle.number)}`;
+  return cycle.name === undefined ? numbered : `${numbered} (${cycle.name})`;
 }
 
 /**

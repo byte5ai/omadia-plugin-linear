@@ -22,12 +22,12 @@ identity:
   # `query_linear`. The domain is the bucket the tool is filed under.
   domain: "linear"
   name: "Linear"
-  version: "0.3.0" # === package.json "version"
+  version: "0.4.0" # === package.json "version"
   # Locale map, not a bare string (#885): a bare string is read as English, so
   # German in this slot would surface as the English description in the Hub.
   description:
-    en: "Works with Linear issues from any channel: searches and reads them, and creates, changes or comments on them. By default every change is shown as a preview first and applied only after your explicit go-ahead."
-    de: "Arbeitet aus jedem Kanal mit Linear-Aufgaben: sucht und liest sie, legt sie an, ändert und kommentiert sie. In der Voreinstellung wird jede Änderung erst als Vorschau gezeigt und nur nach ausdrücklicher Bestätigung übernommen."
+    en: "Works with Linear issues from any channel: searches and reads them, lists projects and cycles, and creates, changes or comments on issues. By default every change is shown as a preview first and applied only after your explicit go-ahead."
+    de: "Arbeitet aus jedem Kanal mit Linear-Aufgaben: sucht und liest sie, listet Projekte und Zyklen auf, legt Aufgaben an, ändert und kommentiert sie. In der Voreinstellung wird jede Änderung erst als Vorschau gezeigt und nur nach ausdrücklicher Bestätigung übernommen."
   authors:
     - name: "byte5 GmbH"
       email: "info@omadia.ai"
@@ -54,12 +54,12 @@ depends_on:
   - "@omadia/integration-linear"
 
 # The typed client. `requires:` (not `optional_requires:`) is correct here
-# because the provider's manifest really does declare `provides: ["linear.api@1"]`
+# because the provider's manifest really does declare `provides: ["linear.api@2"]`
 # — so the capability resolver can match it, order activation, and block an
 # install that would leave this agent without a Linear connection. Matching is
 # major-only; the caret is accepted and documents the intent.
 requires:
-  - "linear.api@^1"
+  - "linear.api@^2"
 
 # The host's turn context: which conversation and which turn a tool call
 # belongs to. The confirmation mode binds a prepared change to its conversation
@@ -153,11 +153,13 @@ playbook:
   # person so that both readers take it the same way.
   when_to_use: >
     Anything to do with Linear issues: what is assigned to someone, what is in
-    progress or already done, what an issue says and who commented on it, plus
-    creating an issue, changing its state, assignee, priority, title,
-    description or labels, and adding a comment. How a change is applied is
-    the operator's setting, and the agent's answer says which of the two
-    happened. Either the change is applied at once. Or it is only prepared:
+    progress, what was completed and when, what waits in triage, what is in a
+    cycle or a project, which projects and cycles there are, what an issue
+    says and who commented on it, plus creating an issue, changing its state,
+    assignee, priority, title, description or labels, and adding a comment.
+    How a change is applied is the operator's setting, and the agent's answer
+    says which of the two happened. Either the change is applied at once. Or
+    it is only prepared:
     nothing is written yet, and the calling agent shows the user the preview
     and asks. When the user has confirmed, in a later turn, the calling agent
     asks this agent again and says that the user confirmed; the prepared change
@@ -171,6 +173,8 @@ playbook:
     - "Acting on behalf of a specific person: every call acts as the API key's owner"
   example_prompts:
     - "What is assigned to me in Linear and still open?"
+    - "What did we complete in the last week?"
+    - "Which urgent bugs are open in the current cycle?"
     - "What does OMA-7 say, and has anyone commented on it?"
     - "Create an issue in OMA: login fails on Safari, high priority."
     - "Move OMA-7 to Done and assign it to me."
@@ -188,7 +192,7 @@ skills:
   - id: "linear-expert"
     kind: "prompt_partial"
     path: "skills/linear-expert.md"
-    description: "How the Linear agent is called, how a tool result reaches it, its vocabulary, how a change is made in each write mode, and how to read a tool error."
+    description: "How the Linear agent is called, how a tool result reaches it, its vocabulary, how to find issues by filter and page by page, how a change is made in each write mode, and how to read a tool error."
     shareable: false
 
 permissions:

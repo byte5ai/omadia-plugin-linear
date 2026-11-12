@@ -11,7 +11,7 @@ import { createToolkit, isWriteMode, type Toolkit, type WriteMode } from './tool
  * credential. Reaching Linear is entirely the connection plugin's job:
  *
  *     depends_on: ["@omadia/integration-linear"]   secret chain, activation order
- *     requires:   ["linear.api@^1"]                makes ctx.services.get legal
+ *     requires:   ["linear.api@^2"]                makes ctx.services.get legal
  *
  * Both declarations are needed and neither substitutes for the other. This
  * plugin must NOT declare `linear_api_key` as a setup field of its own: the
@@ -74,7 +74,7 @@ export async function activate(ctx: PluginContext): Promise<LinearAgentHandle> {
   if (!client) {
     throw new Error(
       `agent-linear: service '${LINEAR_API_SERVICE_NAME}' is not published. Install and configure ` +
-        "@omadia/integration-linear; this plugin must declare requires: ['linear.api@^1'] and " +
+        "@omadia/integration-linear; this plugin must declare requires: ['linear.api@^2'] and " +
         "depends_on: ['@omadia/integration-linear'].",
     );
   }
