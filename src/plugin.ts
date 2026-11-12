@@ -21,10 +21,10 @@ import { createToolkit, type Toolkit } from './toolkit.js';
  * omits `teamKey`.
  *
  * Lifecycle budgets: `activate()` has 10 s, `close()` has 5 s. Activation makes
- * no network call at all: the connection already verifies the key in its own
- * activate(), and repeating that here would put Linear's availability on the
- * critical path twice for one boot. A wrong team key therefore surfaces on the
- * first tool call, as a message naming the keys that do exist.
+ * no network call at all: whether the key works is the Linear connection's
+ * answer, given by its own connection check and shown in the Store. A wrong
+ * team key therefore surfaces on the first tool call, as a message naming the
+ * keys that do exist.
  *
  * The kernel does the rest: it bridges the toolkit into a sub-agent, derives
  * the orchestrator tool name from this plugin's id (`query_linear`), and

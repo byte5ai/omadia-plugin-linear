@@ -128,10 +128,11 @@ appear with no arguments at all.
   `deterministic_action` and `event_emit` flags, none of which apply here; the
   tools the model sees come from the toolkit. Declaring all five a second time
   as JSON Schema would be a copy with nothing to keep it honest.
-- **`self_test: false`.** `true` obliges a plugin to ship an `onConfigure` hook
-  and core never invokes one. The connection already verifies the key during its
-  own activation; a second check here would put Linear's availability on the boot
-  path twice for one boot.
+- **`self_test: false`, and no connection check of its own.** Whether the API
+  key works is the Linear connection's answer: it exports the check core runs
+  after every activation and shows in the Store. This plugin holds no
+  credential to check. (`self_test: true` would oblige it to ship an
+  `onConfigure` hook, which core does not call.)
 - **`linear_prepare_write` takes an enum `kind` plus flat optional fields**
   rather than the discriminated union its three shapes are asking for. The
   host's Zod-to-JSON-schema bridge degrades a union to `{}` without warning, so

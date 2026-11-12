@@ -89,10 +89,10 @@ setup:
         en: "Two to ten letters or digits, e.g. OMA."
         de: "Zwei bis zehn Buchstaben oder Ziffern, z. B. OMA."
   # `self_test: true` obliges a plugin to ship an `onConfigure` hook, and core
-  # never invokes one (nothing in middleware/ references it). The Linear
-  # connection already verifies the key in its own activate(); a second check
-  # here would only put Linear's availability on the boot path twice. A wrong
-  # team key surfaces on the first tool call, naming the keys that do exist.
+  # does not call one. Whether the API key works is answered by the Linear
+  # connection's own connection check and shown in the Store; this plugin
+  # holds no credential to check. A wrong team key surfaces on the first tool
+  # call, naming the keys that do exist.
   self_test: false
 
 llm:
