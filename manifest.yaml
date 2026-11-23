@@ -1,17 +1,17 @@
 schema_version: "1"
 
 # ===========================================================================
-# @omadia/agent-linear — the Linear tools
+# @omadia/plugin-linear — the Linear tools
 # ---------------------------------------------------------------------------
 # A capability plugin of kind `tool` (spec 2042 §5.10, ADR-0014): it registers
 # the Linear tools with the kernel (`ctx.tools.register`) and holds no
 # credential. Linear is reached only through the Linear API capability
 # published by @omadia/integration-linear, which also holds the key.
 #
-# No persona and no model loop of its own: the former Linear agent ships as
-# the agent templates below, which an operator turns into an agent in the
-# Agent Builder. The id keeps its historical `agent-` prefix because installed
-# instances reference it; this version takes over their settings and grants.
+# No persona and no model loop of its own: the working rules for an agent ship
+# as the agent templates below, which an operator turns into an agent in the
+# Agent Builder. Until 0.5.0 this package was `@omadia/agent-linear`; the core
+# has no rename, so a stack with that id installed uninstalls it first.
 #
 # Sources of truth (do not guess):
 #   Client contract   the connection's INTEGRATION.md
@@ -20,12 +20,12 @@ schema_version: "1"
 # ===========================================================================
 
 identity:
-  id: "@omadia/agent-linear" # === package.json "name"
+  id: "@omadia/plugin-linear" # === package.json "name"
   kind: "tool"
   # The bucket every tool of this plugin is filed under (`ctx.domain`).
   domain: "linear"
   name: "Linear"
-  version: "0.5.0" # === package.json "version"
+  version: "0.6.0" # === package.json "version"
   # Locale map, not a bare string (#885): a bare string is read as English, so
   # German in this slot would surface as the English description in the Hub.
   description:
@@ -216,8 +216,8 @@ integrations: []
 
 jobs: []
 
-# Inactive presets (spec 2042 §5.10): the former Linear agent of this
-# package. An operator turns a template into an agent in the Agent Builder and
+# Inactive presets (spec 2042 §5.10): the Linear agent this package used
+# to be. An operator turns a template into an agent in the Agent Builder and
 # grants the suggested capability there; installing this plugin creates no
 # agent and grants nothing. One template per language. The instructions are
 # the working rules the old prompt partial carried, rewritten for an agent
@@ -387,7 +387,7 @@ agent_templates:
       attachments, initiatives and customers; other trackers such as GitHub
       Issues and Jira.
     capabilities:
-      - "@omadia/agent-linear"
+      - "@omadia/plugin-linear"
 
   - id: "linear-de"
     name: "Linear-Assistent"
@@ -579,7 +579,7 @@ agent_templates:
       ändern; Linear-Dokumente, Anhänge, Initiativen und Kunden; andere
       Tracker wie GitHub Issues und Jira.
     capabilities:
-      - "@omadia/agent-linear"
+      - "@omadia/plugin-linear"
 
 ui:
   settings_schema: null

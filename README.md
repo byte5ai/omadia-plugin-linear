@@ -1,4 +1,4 @@
-# `@omadia/agent-linear`
+# `@omadia/plugin-linear`
 
 The **Linear tools**: a capability plugin (`kind: tool`) that gives an agent
 the Linear tools. With them an agent can search and read Linear issues, and
@@ -6,10 +6,9 @@ create, change or comment on them, from any channel. By default every change is
 shown as a preview first and applied only after the user confirms it; the
 operator can switch the confirmation off, or switch changes off altogether.
 
-The plugin has no persona and no model of its own. It ships the former Linear
-agent as two **agent templates** (English and German), from which an operator
-creates an agent in the Agent Builder. The id keeps its historical `agent-`
-prefix, so this version replaces an installed 0.4.x under the same id.
+The plugin has no persona and no model of its own. It ships two **agent
+templates** (English and German), from which an operator creates a Linear
+agent in the Agent Builder.
 
 It holds no credential. Linear is reached through the **Linear API capability**
 (`linear.api@2`) published by [`@omadia/integration-linear`](https://github.com/byte5ai/omadia-integration-linear),
@@ -18,7 +17,7 @@ client contract is that package's `INTEGRATION.md`; read it before changing
 anything here.
 
 ```
-@omadia/integration-linear          @omadia/agent-linear
+@omadia/integration-linear          @omadia/plugin-linear
   linear_api_key (secret)             default_team_key, linear_write_mode
   provides: linear.api@2      <────   requires: linear.api@^2
   egress: api.linear.app              egress: none
@@ -35,7 +34,7 @@ plan is enough. The key goes into the connection, not into this plugin.
    `requires:` is unresolved and it will not activate.
 2. `npm run build` here, then in the web UI: **Store** (`/store`) → source
    switch **Lokal** → box "Neues Agent-Package hochladen." → **Datei wählen**
-   → `out/omadia-agent-linear-<version>.zip`. Expect "✓ Hochgeladen" and a
+   → `out/omadia-plugin-linear-<version>.zip`. Expect "✓ Hochgeladen" and a
    card **Linear** among the capabilities. (Or
    `POST /api/v1/install/plugins/:id` followed by `/configure`.)
 3. Install the card and enter the **Standard-Teamkürzel** (default team
@@ -60,9 +59,9 @@ plan is enough. The key goes into the connection, not into this plugin.
    - create one from a template: **Agent-Builder** (`/admin/builder`) →
      **Neuer Agent** → **Ausgangspunkt** "Linear Assistant — Linear" or
      "Linear-Assistent — Linear". The template fills in name, description and
-     instructions and suggests the capability `@omadia/agent-linear`: tick
+     instructions and suggests the capability `@omadia/plugin-linear`: tick
      it, choose who may reach the agent, and **Agent anlegen**; or
-   - grant `@omadia/agent-linear` to an existing agent. Such an agent gets the
+   - grant `@omadia/plugin-linear` to an existing agent. Such an agent gets the
      tools and their descriptions, which carry the write rule, but not the
      template's working rules for searching and answering.
 
@@ -70,17 +69,13 @@ plan is enough. The key goes into the connection, not into this plugin.
 version, keeps the settings and reactivates the plugin; there is no install
 step. When a release raises the capability it needs (`linear.api@^1` →
 `@^2`), upload the connection first. Uploaded the other way round, the host
-has been seen to activate the agent anyway, against the old connection.
+has been seen to activate these tools anyway, against the old connection.
 
-**Updating from 0.4.x** (the retired agent plugin): omadia refuses to upload
-or install a plugin of kind `agent` since 0.224 (plugin-api 1.83), and no
-longer runs an installed one since 0.226 (plugin-api 1.86); the Store then
-shows it as "Aktivierung fehlgeschlagen" with the retired kind `agent`. Upload 0.5.x as
-above: settings and the agents it was attached to carry over, and those agents
-now call the Linear tools themselves instead of a `query_linear` sub-agent. On
-omadia 0.227 the upload does not start the new version by itself; it starts
-after the next restart of the middleware. Agents that should work by the
-template's rules are created from it as in step 6.
+**Coming from `@omadia/agent-linear`** (this package up to 0.5.0, the Linear
+agent plugin before it): omadia has no way to rename a plugin, so the new id
+is a new plugin. Uninstall `@omadia/agent-linear`, then install this one as
+above and enter the team key and write mode again. Since omadia 0.226 the old
+one does not run anyway; its Store page says "Aktivierung fehlgeschlagen".
 
 ## Using it
 
@@ -138,8 +133,8 @@ under the person who asked.
 |---|---|---|
 | Red badge and banner on the Linear connection; the chat answer says Linear rejected the API key. | The key was revoked, mistyped or belongs to another workspace. Log: `connection check: Linear rejected the API key (http_401)`, at call time `Linear rejected the API key during a request (http_401) — status set to error`. | Paste a valid key on the connection's page, section **Setup-Felder editieren**, then **Verbindung testen**. |
 | The plugin does not activate, or the install reports a missing capability. | The connection is not installed, or is older than the capability this plugin requires. | Install or update the connection, then this plugin. |
-| "Aktivierung fehlgeschlagen", retired kind `agent`. | An installed 0.4.x on omadia 0.226 or newer. | Upload 0.5.x; restart the middleware if the page still shows the old status. |
-| An agent never uses Linear. | The plugin is installed but granted to no agent. | Create an agent from the Linear template, or grant `@omadia/agent-linear` to the agent (step 6). |
+| `@omadia/agent-linear` shows "Aktivierung fehlgeschlagen", retired kind `agent`. | The plugin this package replaces, on omadia 0.226 or newer. | Uninstall it and install `@omadia/plugin-linear`. |
+| An agent never uses Linear. | The plugin is installed but granted to no agent. | Create an agent from the Linear template, or grant `@omadia/plugin-linear` to the agent (step 6). |
 | Reading works, every change fails at Linear. | The API key is restricted to reading. | Set **Änderungen in Linear** to "Aus (nur lesen)", or use a key with write access. |
 | "The prepared change expired …" after a yes. | More than ten minutes passed since the preview. | Ask for the change again and confirm the new preview. |
 | "No change is waiting for confirmation …" after a yes. | The change was already written, a newer preview replaced it, or it expired more than a day ago. | Check Linear; ask for the change again if it is missing. |

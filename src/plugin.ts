@@ -6,15 +6,13 @@ import { registerToolkit } from './registerTools.js';
 import { createToolkit, isWriteMode, type WriteMode } from './toolkit.js';
 
 /**
- * `@omadia/agent-linear` — the Linear tools.
+ * `@omadia/plugin-linear` — the Linear tools.
  *
  * A capability plugin of kind `tool` (spec 2042 §5.10, ADR-0014): it registers
- * the Linear tools with the kernel and holds no credential. The id keeps its
- * historical `agent-` prefix because installed instances reference it: a new
- * version under the same id takes over their settings and grants. The plugin
- * has no persona and no model loop of its own; the former Linear agent ships
- * as the agent templates in manifest.yaml, which an operator turns into an
- * agent in the Agent Builder.
+ * the Linear tools with the kernel and holds no credential. The plugin has no
+ * persona and no model loop of its own; the working rules for an agent ship as
+ * the agent templates in manifest.yaml, which an operator turns into an agent
+ * in the Agent Builder.
  *
  * Reaching Linear is entirely the connection plugin's job:
  *
@@ -44,7 +42,7 @@ import { createToolkit, isWriteMode, type WriteMode } from './toolkit.js';
  * keys that do exist.
  */
 
-export const PLUGIN_ID = '@omadia/agent-linear' as const;
+export const PLUGIN_ID = '@omadia/plugin-linear' as const;
 
 /** The capability this plugin consumes. Must match `requires:` in manifest.yaml
  *  and `provides:` in the connection's manifest. */
@@ -74,7 +72,7 @@ export async function activate(ctx: PluginContext): Promise<LinearToolsHandle> {
   const client = ctx.services.get<LinearClient>(LINEAR_API_SERVICE_NAME);
   if (!client) {
     throw new Error(
-      `agent-linear: service '${LINEAR_API_SERVICE_NAME}' is not published. Install and configure ` +
+      `plugin-linear: service '${LINEAR_API_SERVICE_NAME}' is not published. Install and configure ` +
         "@omadia/integration-linear; this plugin must declare requires: ['linear.api@^2'] and " +
         "depends_on: ['@omadia/integration-linear'].",
     );
@@ -135,8 +133,8 @@ function readDefaultTeamKey(ctx: PluginContext): string {
   const value = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
   if (value.length === 0) {
     throw new Error(
-      `agent-linear: '${DEFAULT_TEAM_KEY_FIELD}' is not set. Enter the key of the Linear team this agent ` +
-        "should work in (the prefix of its issue keys, e.g. 'OMA' for OMA-7) in the plugin settings.",
+      `plugin-linear: '${DEFAULT_TEAM_KEY_FIELD}' is not set. Enter the key of the Linear team these tools ` +
+        "work in by default (the prefix of its issue keys, e.g. 'OMA' for OMA-7) in the plugin settings.",
     );
   }
   return value;

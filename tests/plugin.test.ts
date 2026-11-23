@@ -345,7 +345,7 @@ describe('turn context', () => {
 
 describe('constants', () => {
   it('agrees with the manifest and package.json on the plugin id', () => {
-    assert.equal(PLUGIN_ID, '@omadia/agent-linear');
+    assert.equal(PLUGIN_ID, '@omadia/plugin-linear');
   });
 
   it('names the capability the connection publishes', () => {
