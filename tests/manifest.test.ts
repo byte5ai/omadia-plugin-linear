@@ -428,8 +428,9 @@ describe('agent templates', () => {
 });
 
 describe('shipped files', () => {
-  // The internal working layer must never be referenced from anything that
-  // leaves this repository. See the repo's own rule on it.
+  // The maintainer keeps working notes in a local `_scratch/` directory next
+  // to the checkout. It is not part of this repository, and nothing in it may
+  // be referenced from a file that is.
   const FILES = [
     'manifest.yaml',
     'package.json',
@@ -455,10 +456,10 @@ describe('shipped files', () => {
     it(`${rel} references no internal working directory`, () => {
       const text = readFileSync(join(root, rel), 'utf8');
       // The needle carries the separator on purpose: the reference that must
-      // never ship is a path into the working directory, and matching the bare
-      // word would also flag prose about the unrelated `filesystem.scratch`
+      // never ship is a path into that directory, and matching the bare word
+      // would also flag prose about the unrelated `filesystem.scratch`
       // manifest key.
-      assert.ok(!text.includes('.scratch/'), `${rel} references the internal working directory`);
+      assert.ok(!text.includes('_scratch/'), `${rel} references the internal working directory`);
     });
   }
 });

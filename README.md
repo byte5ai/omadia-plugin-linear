@@ -12,7 +12,7 @@ creates an agent in the Agent Builder. The id keeps its historical `agent-`
 prefix, so this version replaces an installed 0.4.x under the same id.
 
 It holds no credential. Linear is reached through the **Linear API capability**
-(`linear.api@2`) published by [`@omadia/integration-linear`](../omadia-integration-linear),
+(`linear.api@2`) published by [`@omadia/integration-linear`](https://github.com/byte5ai/omadia-integration-linear),
 which owns the personal API key and the `api.linear.app` egress allow-list. The
 client contract is that package's `INTEGRATION.md`; read it before changing
 anything here.
