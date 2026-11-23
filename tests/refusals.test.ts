@@ -31,16 +31,18 @@ import {
 // ---------------------------------------------------------------------------
 //
 // What the model receives is decided by the host, not by this package: the
-// bridge parses the input, runs the tool and turns whatever is thrown into an
-// `Error:` result. This package cannot import the host, so the rules it
-// depends on are restated here, and the tests below assert the text the model
-// ends up with rather than the exception that produced it.
+// kernel calls the registered handler with the raw input and turns whatever
+// it throws into an `Error:` result. This package cannot import the host, so
+// the rules it depends on are restated here, and the tests below assert the
+// text the model ends up with rather than the exception that produced it.
 //
-//   - input fails the schema      -> readable hint (path + message)
-//   - `run` throws a refusal      -> `refused the call: <message>`: an error
+//   - the handler throws a refusal -> `refused the call: <message>`: an error
 //     named ToolRefusalError whose message has no line break, cut at 600
-//   - `run` throws anything else  -> class name and log reference only; the
+//   - it throws anything else      -> class name and log reference only; the
 //     message is withheld
+//
+// The kernel does not validate the input of a plugin tool. `run` does, and
+// answers a mismatch with a refusal (`parseInput` in toolkit.ts).
 //
 // If the host changes these rules this restatement goes stale without failing,
 // which is why the install test exercises the same cases against a real host.
@@ -57,18 +59,8 @@ async function throughHostBridge(
   tool: ToolDescriptor<unknown, unknown>,
   input: unknown,
 ): Promise<string> {
-  let parsed: unknown;
   try {
-    parsed = tool.input.parse(input);
-  } catch (err) {
-    const issues = (err as { issues?: { path: unknown[]; message: string }[] }).issues ?? [];
-    const listed = issues
-      .map((i) => `${i.path.length > 0 ? i.path.map(String).join('.') : '<root>'}: ${i.message}`)
-      .join('; ');
-    return `Error: invalid input for \`${tool.id}\` — ${listed}`;
-  }
-  try {
-    const result = await tool.run(parsed);
+    const result = await tool.run(input);
     return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
   } catch (err) {
     if (
@@ -321,8 +313,8 @@ describe('refusals reach the model as readable text', () => {
     assert.equal(
       text,
       'This change was prepared in this same turn, so the user has not seen its preview yet. ' +
-        'Nothing was written. Hand off the preview and end your turn; commit when a later ' +
-        'question says the user confirmed.',
+        'Nothing was written. Show the user the preview and end your turn; commit when the user ' +
+        'has confirmed it in a later message.',
     );
     assert.deepEqual(mock.mutations(), []);
     assert.ok(store.peek(CONVERSATION), 'the change must still wait for the next turn');
@@ -359,14 +351,17 @@ describe('refusals reach the model as readable text', () => {
     }
   });
 
-  it('a misspelt field stays a readable input hint', async () => {
+  it('a misspelt field is a refusal that names it', async () => {
     const { toolkit } = setup();
     const text = await call(toolkit, 'linear_prepare_write', {
       kind: 'update_issue',
       issueKey: 'OMA-7',
       state: 'Done',
     });
-    assert.match(text, /^Error: invalid input for `linear_prepare_write` — <root>: Unrecognized key/);
+    assert.match(
+      text,
+      /^Error: tool `linear_prepare_write` refused the call: Invalid input — <root>: Unrecognized key: "state"\. Nothing was read or written; correct the call and send it again\.$/,
+    );
   });
 });
 

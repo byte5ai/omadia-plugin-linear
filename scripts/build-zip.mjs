@@ -20,10 +20,9 @@
  *
  *   - `@omadia/plugin-api` — a host-provided peer. Inlining it would fork the
  *     host's own types at runtime.
- *   - `zod` — also host-provided (the middleware ships zod 4). Inlining a
- *     second copy would give the kernel's tool bridge a schema built by a
- *     different zod instance than the one it introspects, and the bridge reads
- *     `_def` internals: the input schema would silently come out as `{}`.
+ *   - `zod` — also host-provided (the middleware ships zod 4, whose
+ *     `z.toJSONSchema` builds the tools' input schemas in registerTools.ts).
+ *     Inlining it would ship a second copy of what the host already has.
  *
  * `@omadia/integration-linear` needs no entry: this package imports only its
  * types, so the import is erased before esbuild ever resolves it.
@@ -53,13 +52,9 @@ const pkgRoot = resolve(here, '..');
 
 const REQUIRED_FILES = ['manifest.yaml'];
 // The package contract lists what a zip may hold: manifest, package.json,
-// dist/, skills/, assets/, README, LICENSE.
+// dist/, skills/, assets/, README, LICENSE. This package ships no skills: the
+// working rules for an agent are in the manifest's `agent_templates:`.
 const OPTIONAL_FILES = ['README.md', 'LICENSE'];
-// `skills/` is not optional here even though the contract allows a plugin
-// without one. The manifest's `skills[]` entry points at it, and the runtime
-// swallows a missing partial: the agent would activate with no prompt guidance
-// at all — including no prepare/preview/commit rule — and nothing would say so.
-const REQUIRED_DIRS = ['skills'];
 /** The manifest's `lifecycle.entry`. Its absence means the build did not finish. */
 const REQUIRED_IN_DIST = ['plugin.js', 'plugin.d.ts'];
 
@@ -146,13 +141,6 @@ console.log('  + package.json (devDependencies + scripts stripped)');
 
 cpSync(distDir, join(stageDir, 'dist'), { recursive: true });
 console.log('  + dist/');
-
-for (const rel of REQUIRED_DIRS) {
-  const src = join(pkgRoot, rel);
-  if (!existsSync(src)) throw new Error(`missing required directory: ${rel}/`);
-  cpSync(src, join(stageDir, rel), { recursive: true });
-  console.log(`  + ${rel}/`);
-}
 
 for (const rel of OPTIONAL_FILES) {
   const src = join(pkgRoot, rel);

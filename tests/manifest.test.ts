@@ -4,14 +4,15 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
-  AGENT_ID,
   DEFAULT_TEAM_KEY_FIELD,
   DEFAULT_WRITE_MODE,
   LINEAR_API_SERVICE_NAME,
+  PLUGIN_ID,
   TURN_CONTEXT_SERVICE_NAME,
   WRITE_MODE_FIELD,
 } from '../src/plugin.js';
-import { isWriteMode } from '../src/toolkit.js';
+import { createToolkit, isWriteMode, type WriteMode } from '../src/toolkit.js';
+import { createLog, createMockLinear, createTurns } from './fixtures.js';
 
 /**
  * Manifest, code and package.json consistency.
@@ -25,12 +26,13 @@ import { isWriteMode } from '../src/toolkit.js';
  *   - an entry that disagrees with the build produces a plugin core cannot
  *     start;
  *   - the Linear API capability under `optional_requires:` instead of
- *     `requires:` would let this agent activate with no Linear connection at
+ *     `requires:` would let these tools activate with no Linear connection at
  *     all and fail on the first tool call;
  *   - a redeclared `linear_api_key` field would override the connection's
  *     secret with an empty one and nothing would warn;
- *   - a missing `skills/` partial degrades the system prompt to nothing, taking
- *     the prepare/preview/commit rule with it.
+ *   - a tool without a declared effect is checked by the kernel as a write;
+ *   - a persona, a prompt partial or the retired kind `agent` makes the host
+ *     refuse the upload.
  *
  * Line-oriented rather than a YAML parse: the package's only dependencies are
  * zod and the host peers, and a parser for one test file is the worse trade
@@ -39,7 +41,6 @@ import { isWriteMode } from '../src/toolkit.js';
 
 const root = process.cwd();
 const manifest = readFileSync(join(root, 'manifest.yaml'), 'utf8');
-const skill = readFileSync(join(root, 'skills/linear-expert.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   name: string;
   version: string;
@@ -66,10 +67,67 @@ function hasKey(key: string): boolean {
   return new RegExp(`^\\s*${key}:`, 'm').test(manifest);
 }
 
+/** The text of a top-level block, from its key to the next top-level key. */
+function topLevelBlock(key: string): string {
+  const m = new RegExp(`^${key}:\\n([\\s\\S]*?)(?=^[a-z_]+:)`, 'm').exec(manifest);
+  assert.ok(m, `top-level block not found: ${key}`);
+  return m?.[1] ?? '';
+}
+
+interface Template {
+  readonly id: string;
+  readonly language: string;
+  readonly shortDescription: string;
+  readonly text: string;
+  readonly instructions: string;
+}
+
+/** The entries of `agent_templates:`, each with its folded instructions. */
+function templates(): Template[] {
+  const block = topLevelBlock('agent_templates');
+  return block
+    .split(/^ {2}- /m)
+    .slice(1)
+    .map((entry) => ({
+      id: /^id: "([^"]+)"/.exec(entry)?.[1] ?? '',
+      language: /^ {4}language: "([^"]+)"/m.exec(entry)?.[1] ?? '',
+      shortDescription: /^ {4}short_description: "([^"]+)"/m.exec(entry)?.[1] ?? '',
+      text: entry,
+      instructions: (/^ {4}instructions: \|\n((?:(?: {6}.*)?\n)+)/m.exec(entry)?.[1] ?? '').replace(/^ {6}/gm, ''),
+    }));
+}
+
+function template(language: string): Template {
+  const found = templates().find((t) => t.language === language);
+  assert.ok(found, `no agent template in language '${language}'`);
+  return found;
+}
+
+/** Whitespace folded, so a needle may span a line break of the YAML block. */
+function folded(text: string): string {
+  return text.replace(/\s+/g, ' ');
+}
+
+/** Every tool the code registers in any write mode. */
+function toolIdsOfEveryMode(): string[] {
+  const ids = new Set<string>();
+  for (const writeMode of ['confirm', 'direct', 'off'] satisfies WriteMode[]) {
+    const toolkit = createToolkit({
+      client: createMockLinear().client,
+      defaultTeamKey: 'OMA',
+      writeMode,
+      caller: createTurns().caller,
+      log: createLog().log,
+    });
+    for (const tool of toolkit.tools) ids.add(tool.id);
+  }
+  return [...ids];
+}
+
 describe('manifest.yaml <-> package.json', () => {
   it('declares the same id and version', () => {
     assert.equal(scalar('id'), pkg.name);
-    assert.equal(scalar('id'), AGENT_ID);
+    assert.equal(scalar('id'), PLUGIN_ID);
     assert.equal(scalar('version'), pkg.version);
   });
 
@@ -93,10 +151,44 @@ describe('manifest.yaml <-> package.json', () => {
 });
 
 describe('manifest.yaml <-> code', () => {
-  it('is an agent in the linear domain', () => {
-    assert.equal(scalar('kind'), 'agent');
-    // Drives the orchestrator tool name: `@omadia/agent-linear` -> query_linear.
+  it('is a tool capability in the linear domain', () => {
+    // `agent` is a retired kind: the host refuses its upload and starts no
+    // installed copy. The id stays, so this version replaces such a copy.
+    assert.equal(scalar('kind'), 'tool');
     assert.equal(scalar('domain'), 'linear');
+  });
+
+  it('asks for the kernel that knows capability kinds, templates and tool effects', () => {
+    assert.equal(scalar('core'), '>=1.78.0 <2.0');
+  });
+
+  it('declares the effect of every tool the code has, and of no other', () => {
+    const declared = new Map(
+      [...topLevelBlock('capabilities').matchAll(/- id: "([^"]+)"\n(?:\s*#.*\n)*\s*side_effects: "([^"]+)"/g)].map(
+        (m) => [m[1] ?? '', m[2] ?? ''],
+      ),
+    );
+    assert.deepEqual([...declared.keys()].sort(), toolIdsOfEveryMode().sort());
+    assert.deepEqual(Object.fromEntries(declared), {
+      linear_search_issues: 'read',
+      linear_get_issue: 'read',
+      linear_lookup: 'read',
+      // Reads Linear to resolve names; the change waits in memory.
+      linear_prepare_write: 'read',
+      linear_commit_write: 'write',
+      linear_write: 'write',
+    });
+  });
+
+  it('ships no persona, no prompt partial and no model settings', () => {
+    // The host refuses a package with a persona of its own (422
+    // package.persona_declared); a capability has no model loop to configure.
+    for (const key of ['skills', 'llm', 'persona', 'speaker', 'personality', 'system_prompt']) {
+      assert.ok(!new RegExp(`^${key}:`, 'm').test(manifest), `top-level '${key}:' must not be declared`);
+    }
+    assert.ok(!manifest.includes('prompt_partial'), 'no prompt_partial skill');
+    assert.ok(!existsSync(join(root, 'skills')), 'no skills/ directory');
+    assert.ok(!existsSync(join(root, 'AGENT.md')), 'no AGENT.md');
   });
 
   it('depends on the connection, so the secret chain resolves', () => {
@@ -107,14 +199,14 @@ describe('manifest.yaml <-> code', () => {
     assert.deepEqual(listItems('requires'), [`${LINEAR_API_SERVICE_NAME}@^2`]);
     assert.ok(
       !listItems('optional_requires').some((c) => c.startsWith(LINEAR_API_SERVICE_NAME)),
-      'optional_requires would let this agent activate without a Linear connection',
+      'optional_requires would let these tools activate without a Linear connection',
     );
   });
 
   it('asks for the turn context as an option, never as a prerequisite', () => {
     // `optional_requires:` is what grants `ctx.services.get('turnContext')`.
     // Under `requires:` a host without the service could not activate the
-    // agent at all, not even to read.
+    // plugin at all, not even to read.
     assert.deepEqual(listItems('optional_requires'), [`${TURN_CONTEXT_SERVICE_NAME}@1`]);
   });
 
@@ -152,7 +244,7 @@ describe('manifest.yaml <-> code', () => {
     assert.match(
       manifest,
       /^\s*outbound: \[\]/m,
-      'permissions.network.outbound must be empty for an integration-backed agent',
+      'permissions.network.outbound must be empty: the connection makes every request',
     );
   });
 
@@ -170,31 +262,16 @@ describe('manifest.yaml <-> code', () => {
     assert.ok(!hasKey('routes'));
   });
 
-  it('tells the orchestrator when to route to this agent', () => {
-    assert.match(manifest, /^playbook:/m);
-    assert.match(manifest, /when_to_use:/);
-    assert.match(manifest, /not_for:/);
-  });
-
-  it('tells the orchestrator its half of the write rule', () => {
-    // `when_to_use` becomes the description of `query_linear`: the one text of
-    // this package the orchestrator's model reads before it calls. It has to
-    // cover every write mode, because the text is fixed and the mode is not.
+  it('says when the capability fits, in every write mode', () => {
     const whenToUse = /when_to_use: >\n((?: {4}\S.*\n)+)/.exec(manifest)?.[1]?.replace(/\s+/g, ' ');
     assert.ok(whenToUse, 'playbook.when_to_use must be a folded block');
+    assert.match(manifest, /not_for:/);
     for (const needle of [
       "How a change is applied is the operator's setting",
-      "the agent's answer says which of the two happened",
-      'Either the change is applied at once.',
-      'Or it is only prepared: nothing is written yet',
-      'the calling agent shows the user the preview and asks',
-      'When the user has confirmed, in a later turn',
-      'says that the user confirmed',
-      'the prepared change is then applied, exactly as the preview showed it.',
-      "When the agent's answer says that a change is applied, it was written in full",
-      'the user is told what was done and is not asked to check it.',
-      'One change waits per conversation, for ten minutes.',
-      'If changes are switched off, the agent says so.',
+      'with confirmation, a change is first prepared and shown to the user as a preview',
+      'applied only after the user says yes in a later message',
+      'without confirmation it is applied at once',
+      'changes are switched off and the tools only read',
     ]) {
       assert.ok(whenToUse.includes(needle), `playbook.when_to_use must state: ${needle}`);
     }
@@ -202,187 +279,151 @@ describe('manifest.yaml <-> code', () => {
   });
 });
 
-describe('prompt partial', () => {
-  it('is the file the manifest points at', () => {
-    assert.match(manifest, /path:\s*"skills\/linear-expert\.md"/);
-    assert.match(manifest, /id:\s*"linear-expert"/);
-    assert.match(manifest, /kind:\s*"prompt_partial"/);
-    assert.ok(existsSync(join(root, 'skills/linear-expert.md')));
-  });
-
-  it('carries the frontmatter the runtime strips', () => {
-    assert.match(skill, /^---\nid: linear-expert\nkind: prompt_partial\n---\n/);
-  });
-
-  it('states the prepare, preview, confirm, commit rule', () => {
-    for (const needle of [
-      'linear_prepare_write',
-      'linear_commit_write',
-      'Commit only on a question that says the user confirmed.',
-      'One change per confirmation.',
-      'A commit in the turn that prepared is refused.',
-    ]) {
-      assert.ok(skill.includes(needle), `the prompt partial must state: ${needle}`);
-    }
-  });
-
-  it('says how a tool result reaches the agent', () => {
-    // On a host with a privacy filter the model gets a digest of every tool
-    // result: handles, numbers and dates, and `[masked]` for any text. A
-    // partial written for results in full asks for things the model cannot do,
-    // such as quoting a preview it never saw.
-    assert.match(skill, /## What you get back/);
-    assert.match(skill, /in full or as a \*\*digest\*\*/);
-    assert.match(skill, /shows as `\[masked\]`/);
-    assert.match(skill, /A masked value is real\./);
-    assert.match(skill, /say that the rest is\s+in the result/);
-  });
-
-  it('takes a masked value for certain, and reports an applied change as fact', () => {
-    // From a commit result a model on a masking host reads `committed` and
-    // the issue key. Without these lines it reports the rest as unchecked and
-    // has the user verify a change that was written exactly as previewed.
-    assert.match(skill, /Masked means that you cannot quote a value\. The value itself is certain/);
-    assert.match(skill, /state what a result says as fact/);
-    assert.match(skill, /Nothing in a\s+result is left for the user to check\./);
-    assert.match(
-      skill,
-      /`committed: true` says that\s+Linear took the prepared write whole: every field of it, exactly as the\s+preview showed it to the user/,
+describe('agent templates', () => {
+  it('ships one per language, each suggesting this plugin', () => {
+    assert.deepEqual(
+      templates().map((t) => [t.id, t.language]),
+      [
+        ['linear', 'en'],
+        ['linear-de', 'de'],
+      ],
     );
-    assert.match(skill, /> Applied, exactly as the user confirmed it\. Issue: OMA-7\./);
-    assert.match(skill, /> Übernommen, genau wie vom Nutzer bestätigt\. Aufgabe: OMA-7\./);
-    // The direct mode has no preview; the fact is that every value passed was taken.
-    assert.match(skill, /`committed: true` says that Linear\s+took every value you passed/);
+    for (const t of templates()) {
+      assert.match(t.text, new RegExp(`capabilities:\\n\\s*- "${PLUGIN_ID}"`), `${t.id} suggests ${PLUGIN_ID}`);
+      // The host's limits for a template (agent create route): checked here so
+      // an upload is not the first place to learn of an overlong text.
+      assert.ok(t.shortDescription.length > 0 && t.shortDescription.length <= 80, `${t.id}: short_description`);
+      assert.ok(t.instructions.length > 0 && t.instructions.length <= 20_000, `${t.id}: instructions`);
+    }
   });
 
-  it('keys the write rules on the tools the agent has', () => {
-    // The partial is one fixed file and the write mode is the operator's
-    // setting. The model sees its tool list, so the partial lets that list
-    // say which rules apply.
-    assert.match(skill, /The write tools you have are the operator's setting/);
-    assert.match(skill, /`linear_prepare_write` and `linear_commit_write` — a change needs the user's\s+confirmation/);
-    assert.match(skill, /`linear_write` — a change is applied at once/);
-    assert.match(skill, /neither — you read only/);
-    assert.match(skill, /### With confirmation/);
-    assert.match(skill, /### Without confirmation/);
+  it('carry a name per language, so the Agent Builder can tell them apart', () => {
+    // The builder lists a template as "<name> — <plugin name>"; two templates
+    // of one name read as one entry twice.
+    const names = templates().map((t) => /^ {4}name: "([^"]+)"/m.exec(t.text)?.[1]);
+    assert.deepEqual(names, ['Linear Assistant', 'Linear-Assistent']);
   });
 
-  it('hands off a prepared write so the caller knows what to do next', () => {
-    assert.match(skill, /The answer is complete when it holds all five:/);
+  it('cover the same sections in both languages', () => {
+    const headings = (text: string): number[] => [
+      [...text.matchAll(/^## /gm)].length,
+      [...text.matchAll(/^### /gm)].length,
+    ];
+    assert.deepEqual(headings(template('de').instructions), headings(template('en').instructions));
+  });
+
+  it('state the prepare, preview, confirm, commit rule', () => {
+    const en = folded(template('en').instructions);
     for (const needle of [
-      'the statement that nothing has been written yet;',
-      'what you prepared, in one sentence of your own;',
-      'verbatim when you can read it; when it is `[masked]`',
-      'until when the user can confirm;',
-      'what your caller does next: ask the user, and after their yes ask you',
+      'Every change takes two messages from the user: the request and the confirmation.',
+      'call `linear_prepare_write`',
+      'Then answer and end your turn.',
+      'says that nothing has been written yet',
+      'shows the preview',
+      'says until when the user can confirm',
+      'a later message in which the user says yes to that preview: call `linear_commit_write`',
+      "Commit only on the user's yes to the preview.",
+      'One change per confirmation.',
+      'A commit in the turn that prepared is refused',
     ]) {
-      assert.ok(skill.includes(needle), `the handoff must hold: ${needle}`);
+      assert.ok(en.includes(needle), `the template must state: ${needle}`);
     }
-    assert.match(skill, /After their yes, ask me again and say that the user confirmed\./);
-    assert.ok(!/token/i.test(skill), 'the agent has no handle to pass on');
-  });
-
-  it('says what the direct mode asks of the agent', () => {
-    assert.match(skill, /`linear_write` applies a change the moment you call it/);
-    assert.match(skill, /Be sure of the change first/);
-    assert.match(skill, /Call `linear_write` once per change\./);
-  });
-
-  it('explains the stateless call shape the handoff depends on', () => {
-    // `LocalSubAgent.ask()` starts every call with one user message, so the
-    // agent that receives the confirmation remembers nothing of the request.
-    // The prepared write waits in the conversation; what the agent has to do
-    // is recognise the confirmation and tell its caller how to send one.
-    assert.match(skill, /## How you are called/);
-    assert.match(skill, /keep no memory between those questions/);
-    assert.match(skill, /what\s+you prepared and what your caller has to do next/);
-    assert.match(skill, /a question saying that the user confirmed\. That\s+statement is the only thing that authorises a commit/);
-  });
-
-  it('tells a refusal apart from a failure whose outcome is unknown', () => {
-    // The host passes a refusal on as `refused the call: …` and withholds
-    // every other error. The model has to answer the two differently: follow
-    // the first, and never repeat a commit after the second. A refusal says
-    // itself what to do next (a rate limit included), so the partial names
-    // the kind once and does not restate each message.
-    assert.match(skill, /## When a tool answers with an error/);
-    assert.match(skill, /\*\*Refusal\*\*/);
-    assert.match(skill, /`refused the call:`/);
-    assert.match(skill, /The error text was withheld/);
-    assert.match(skill, /do \*\*not\*\* make the change again on\s+your own/);
-  });
-
-  it('uses the glossary terms', () => {
-    for (const term of [
-      'Issue',
-      'Workflow state',
-      'Lookup',
-      'Project',
-      'Cycle',
-      'Triage',
-      'Prepared write',
-      'Preview',
-      'Commit',
-      'Default team',
+    const de = folded(template('de').instructions);
+    for (const needle of [
+      'Jede Änderung braucht zwei Nachrichten des Nutzers: den Auftrag und die Bestätigung.',
+      'Rufe `linear_prepare_write` auf.',
+      'Übernimm nur nach dem Ja des Nutzers zur Vorschau.',
+      'Eine Änderung pro Bestätigung.',
+      'Ein Übernehmen im selben Zug wie das Vorbereiten wird abgelehnt',
     ]) {
-      assert.ok(
-        new RegExp(`\\*\\*${term}\\*\\*`).test(skill),
-        `the prompt partial must define the term: ${term}`,
-      );
+      assert.ok(de.includes(needle), `the German template must state: ${needle}`);
+    }
+    for (const t of templates()) assert.ok(!/token/i.test(t.instructions), 'the agent has no handle to pass on');
+  });
+
+  it('key the write rules on the tools the agent has', () => {
+    // The template is fixed text and the write mode is the operator's setting.
+    // The model sees its tool list, so the template lets that list decide.
+    const en = folded(template('en').instructions);
+    assert.ok(en.includes("Which write tools you have is the operator's setting"));
+    assert.ok(en.includes("`linear_prepare_write` and `linear_commit_write`: a change needs the user's confirmation"));
+    assert.ok(en.includes('`linear_write`: a change is applied at once'));
+    assert.ok(en.includes('neither: you only read.'));
+    assert.match(template('en').instructions, /^### With confirmation$/m);
+    assert.match(template('en').instructions, /^### Without confirmation$/m);
+    assert.match(template('de').instructions, /^### Mit Bestätigung$/m);
+    assert.match(template('de').instructions, /^### Ohne Bestätigung$/m);
+  });
+
+  it('report an applied change as fact', () => {
+    // A model on a masking host reads `committed` and the issue key of a
+    // result, not every value. Without this it has the user verify a change
+    // that was written exactly as previewed.
+    const en = folded(template('en').instructions);
+    assert.ok(en.includes('`committed: true` in a result says that Linear took every value of the change.'));
+    assert.ok(en.includes('do not ask them to check it'));
+    assert.ok(folded(template('de').instructions).includes('bitte ihn nicht, es zu prüfen'));
+  });
+
+  it('tell a refusal apart from a failure whose outcome is unknown', () => {
+    const en = folded(template('en').instructions);
+    assert.ok(en.includes('A refusal (`refused the call:`): the tool did nothing.'));
+    assert.ok(en.includes('The error text was withheld'));
+    assert.ok(en.includes('do not make the change again on your own'));
+    assert.ok(folded(template('de').instructions).includes('Mach die Änderung nicht von dir aus noch einmal.'));
+  });
+
+  it('say how to find issues by filter, by time and page by page', () => {
+    const en = folded(template('en').instructions);
+    for (const needle of [
+      'an issue has to match every filter you pass',
+      '`-P7D` is seven days ago',
+      '`current`, `next` or `previous`, a cycle number, or a cycle name',
+      '`stateType: triage`',
+      '`stateType: canceled` and `updatedAfter`',
+      '`hasMore: true` says that more issues match',
+      'the same input plus that `cursor`',
+    ]) {
+      assert.ok(en.includes(needle), `the template must state: ${needle}`);
     }
   });
 
-  it('says what "me" resolves to and how to answer', () => {
-    assert.match(skill, /the key's owner/);
-    assert.match(skill, /Cite issue keys/);
-    assert.match(skill, /\*\*Summarise\.\*\*/);
+  it('say what "me" resolves to and how to answer', () => {
+    const en = folded(template('en').instructions);
+    assert.ok(en.includes("`assignee: \"me\"` is the key's owner, whoever is asking."));
+    assert.ok(en.includes('Cite issue keys.'));
+    assert.ok(en.includes("Answer in the user's language."));
   });
 
-  it('carries the German words for the terms a user gets to read', () => {
-    // The agent is used in German as often as in English. The German word sits
-    // next to the term it belongs to, so the two cannot drift apart; a term
-    // that never reaches a user (Lookup, Refusal) has none.
-    for (const [term, german] of [
-      ['Issue', 'Aufgabe'],
-      ['Workflow state', 'Status'],
-      ['Default team', 'Standard-Team'],
-      ['Project', 'Projekt'],
-      ['Cycle', 'Zyklus'],
-      ['Prepared write', 'vorbereitete Änderung'],
-      ['Preview', 'Vorschau'],
-      ['Commit', 'übernehmen'],
+  it('use the glossary terms, in German with the German words', () => {
+    const en = template('en').instructions;
+    for (const term of ['Issue', 'Workflow state', 'Project', 'Cycle', 'Triage', 'Default team', 'Prepared write', 'Preview']) {
+      assert.match(en, new RegExp(`^- ${term}:`, 'm'), `the template must define the term: ${term}`);
+    }
+    const de = template('de').instructions;
+    for (const [german, term] of [
+      ['Aufgabe', 'Issue'],
+      ['Status', 'Workflow State'],
+      ['Projekt', 'Project'],
+      ['Zyklus', 'Cycle'],
+      ['Standard-Team', 'Default Team'],
+      ['Vorbereitete Änderung', 'Prepared Write'],
+      ['Vorschau', 'Preview'],
+      ['Übernehmen', 'Commit'],
     ] as const) {
-      assert.ok(
-        skill.includes(`**${term}** (*${german}*)`),
-        `the prompt partial must give the German word for ${term}`,
-      );
+      assert.ok(de.includes(`- ${german} (${term}):`), `the German template must define ${german} (${term})`);
     }
-    assert.match(skill, /\*\*Answer in the language of the question\.\*\*/);
-    // The handoff is shown once in German: the agent's own sentences follow
-    // the question's language.
-    assert.match(skill, /Es wurde noch nichts geschrieben\. Vorbereitet: OMA-7 nach Done verschieben\./);
-    assert.match(skill, /Nach dem Ja frag mich erneut und sag, dass der Nutzer bestätigt hat\./);
-    // The preview is what the user agrees to, so a readable one is quoted as
-    // returned, whatever the language of the answer.
-    assert.match(skill, /quoted as returned:\n\n> OMA-7: Todo → Done, assignee unchanged/);
   });
 
-  it('says how to find issues by filter, by time and page by page', () => {
-    assert.match(skill, /^## Finding issues$/m);
-    assert.match(skill, /an issue has to match every filter\s+you pass/);
-    // A span back from now is how "last week" is asked without today's date.
-    assert.match(skill, /`-P7D` is seven\s+days ago/);
-    assert.match(skill, /`current`, `next` or `previous`, a cycle number, or a cycle\s+name/);
-    assert.match(skill, /`stateType: triage`/);
-    assert.match(skill, /`stateType: canceled` and `updatedAfter`/);
-    // What a page is, and what the model does about the rest.
-    assert.match(skill, /`hasMore: true` says that more issues match than you\s+got/);
-    assert.match(skill, /the same input plus that\s+`cursor`/);
+  it('write German without dashes, as the project copy rules ask', () => {
+    const t = template('de');
+    assert.ok(!/[—–]/.test(t.text), 'no em or en dash in the German template');
   });
 
-  it('names the default team as configuration, not a hardcoded key', () => {
-    assert.match(skill, /the team configured for this plugin/);
-    assert.ok(!/\bOMA\b/.test(skill.replace(/`OMA-7`|OMA-7/g, '')), 'no workspace-specific team key');
+  it('name the default team as configuration, not a hardcoded key', () => {
+    for (const t of templates()) {
+      assert.ok(!/\bOMA\b/.test(t.instructions.replace(/`?OMA-7`?/g, '')), `${t.id}: no workspace-specific team key`);
+    }
   });
 });
 
@@ -395,13 +436,14 @@ describe('shipped files', () => {
     'tsconfig.json',
     'tsconfig.build.json',
     'README.md',
-    'skills/linear-expert.md',
     'src/caller.ts',
+    'src/cursor.ts',
     'src/errors.ts',
     'src/lookup.ts',
     'src/plugin.ts',
     'src/preparedWrites.ts',
     'src/preview.ts',
+    'src/registerTools.ts',
     'src/toolkit.ts',
     'scripts/build-zip.mjs',
     'scripts/test.mjs',

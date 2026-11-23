@@ -1,10 +1,15 @@
 # `@omadia/agent-linear`
 
-The **Linear agent**: the Omadia plugin that carries the Linear tools and their
-prompt. From any channel it can search and read Linear issues, and create,
-change or comment on them. By default every change is shown as a preview first
-and applied only after the user confirms it; the operator can switch the
-confirmation off, or switch changes off altogether.
+The **Linear tools**: a capability plugin (`kind: tool`) that gives an agent
+the Linear tools. With them an agent can search and read Linear issues, and
+create, change or comment on them, from any channel. By default every change is
+shown as a preview first and applied only after the user confirms it; the
+operator can switch the confirmation off, or switch changes off altogether.
+
+The plugin has no persona and no model of its own. It ships the former Linear
+agent as two **agent templates** (English and German), from which an operator
+creates an agent in the Agent Builder. The id keeps its historical `agent-`
+prefix, so this version replaces an installed 0.4.x under the same id.
 
 It holds no credential. Linear is reached through the **Linear API capability**
 (`linear.api@2`) published by [`@omadia/integration-linear`](../omadia-integration-linear),
@@ -31,7 +36,7 @@ plan is enough. The key goes into the connection, not into this plugin.
 2. `npm run build` here, then in the web UI: **Store** (`/store`) → source
    switch **Lokal** → box "Neues Agent-Package hochladen." → **Datei wählen**
    → `out/omadia-agent-linear-<version>.zip`. Expect "✓ Hochgeladen" and a
-   second card **Linear**, of kind agent. (Or
+   card **Linear** among the capabilities. (Or
    `POST /api/v1/install/plugins/:id` followed by `/configure`.)
 3. Install the card and enter the **Standard-Teamkürzel** (default team
    key) — the prefix of that team's issue keys, so `OMA` for `OMA-7`. It is
@@ -48,11 +53,18 @@ plan is enough. The key goes into the connection, not into this plugin.
    A Linear API key restricted to reading passes the connection check all the
    same, because that check only reads. With such a key choose `off`:
    otherwise the agent offers changes that all fail at Linear.
-5. **Installation bestätigen.** The host attaches the plugin to the default
-   agent on its own (`fallback`, the agent behind the channels); there is
-   nothing to attach by hand. Both settings can be changed later on the
+5. **Installation bestätigen.** Both settings can be changed later on the
    plugin's page, section **Setup-Felder editieren**; saving reactivates the
    plugin with the new values.
+6. Give the tools to an agent. Installing grants them to nobody. Either:
+   - create one from a template: **Agent-Builder** (`/admin/builder`) →
+     **Neuer Agent** → **Ausgangspunkt** "Linear Assistant — Linear" or
+     "Linear-Assistent — Linear". The template fills in name, description and
+     instructions and suggests the capability `@omadia/agent-linear`: tick
+     it, choose who may reach the agent, and **Agent anlegen**; or
+   - grant `@omadia/agent-linear` to an existing agent. Such an agent gets the
+     tools and their descriptions, which carry the write rule, but not the
+     template's working rules for searching and answering.
 
 **Updating:** upload a newer zip the same way. It replaces the installed
 version, keeps the settings and reactivates the plugin; there is no install
@@ -60,13 +72,20 @@ step. When a release raises the capability it needs (`linear.api@^1` →
 `@^2`), upload the connection first. Uploaded the other way round, the host
 has been seen to activate the agent anyway, against the old connection.
 
-The orchestrator reaches this agent as the tool `query_linear`, derived from the
-plugin id. The tools below are the sub-agent's, not the orchestrator's.
+**Updating from 0.4.x** (the retired agent plugin): omadia refuses to upload
+or install a plugin of kind `agent` since 0.224 (plugin-api 1.83), and no
+longer runs an installed one since 0.226 (plugin-api 1.86); the Store then
+shows it as "Aktivierung fehlgeschlagen" with the retired kind `agent`. Upload 0.5.x as
+above: settings and the agents it was attached to carry over, and those agents
+now call the Linear tools themselves instead of a `query_linear` sub-agent. On
+omadia 0.227 the upload does not start the new version by itself; it starts
+after the next restart of the middleware. Agents that should work by the
+template's rules are created from it as in step 6.
 
 ## Using it
 
-Ask in any channel bound to the default agent, in German or English. Name
-the team when it is not the default one. For example:
+Ask an agent that has the tools, in any channel it is bound to, in German or
+English. Name the team when it is not the default one. For example:
 
 - *Welche Aufgaben sind im Team OMA offen?*
 - *Was haben wir in den letzten zwei Wochen erledigt?*
@@ -82,7 +101,8 @@ same conversation applies it; the answer names the issue key. A different
 wording ("nein, schreib stattdessen …") replaces the preview. A preview is
 valid for ten minutes; a yes after that is told the preview expired, and the
 agent prepares it again for a new yes. Several changes asked for at once are
-confirmed one after the other.
+confirmed one after the other. The yes has to reach the same agent in the same
+conversation: a preview is bound to both.
 
 Everything written appears in Linear under the owner of the API key, not
 under the person who asked.
@@ -91,13 +111,13 @@ under the person who asked.
 
 - **One identity.** Every read and every change acts as the owner of the API
   key. Who asked in omadia is not visible in Linear, and everyone who can
-  reach the default agent can read what that key can read. Per-user identity
-  would need OAuth, which is not built.
+  reach an agent with these tools can read what that key can read. Per-user
+  identity would need OAuth, which is not built.
 - **No Push.** Linear does not notify omadia; the agent answers only when
   asked.
-- **Speed.** A Linear question passes two models in a row (the main agent,
-  then this agent), so an answer takes about 10–30 seconds. Linear itself
-  answers in well under a second.
+- **Speed.** The agent's model calls the tools itself, one model round per
+  tool call, so an answer takes some seconds. Linear itself answers in well
+  under a second.
 - **Rate limits.** A personal key is capped by Linear (near 2,500 requests an
   hour). Past the cap the agent says so and names the time the limit resets.
 - **Privacy Shield.** In the default privacy mode the models read a digest of
@@ -117,7 +137,9 @@ under the person who asked.
 | Symptom | Cause | What to do |
 |---|---|---|
 | Red badge and banner on the Linear connection; the chat answer says Linear rejected the API key. | The key was revoked, mistyped or belongs to another workspace. Log: `connection check: Linear rejected the API key (http_401)`, at call time `Linear rejected the API key during a request (http_401) — status set to error`. | Paste a valid key on the connection's page, section **Setup-Felder editieren**, then **Verbindung testen**. |
-| The agent does not activate, or the install reports a missing capability. | The connection is not installed, or is older than the capability this agent requires. | Install or update the connection, then the agent. |
+| The plugin does not activate, or the install reports a missing capability. | The connection is not installed, or is older than the capability this plugin requires. | Install or update the connection, then this plugin. |
+| "Aktivierung fehlgeschlagen", retired kind `agent`. | An installed 0.4.x on omadia 0.226 or newer. | Upload 0.5.x; restart the middleware if the page still shows the old status. |
+| An agent never uses Linear. | The plugin is installed but granted to no agent. | Create an agent from the Linear template, or grant `@omadia/agent-linear` to the agent (step 6). |
 | Reading works, every change fails at Linear. | The API key is restricted to reading. | Set **Änderungen in Linear** to "Aus (nur lesen)", or use a key with write access. |
 | "The prepared change expired …" after a yes. | More than ten minutes passed since the preview. | Ask for the change again and confirm the new preview. |
 | "No change is waiting for confirmation …" after a yes. | The change was already written, a newer preview replaced it, or it expired more than a day ago. | Check Linear; ask for the change again if it is missing. |
@@ -135,8 +157,13 @@ under the person who asked.
 | `linear_get_issue` | all | One issue by key, with its description and most recent comments. |
 | `linear_lookup` | all | Teams, workflow states, workspace members, labels, projects or cycles — the records a search or a write refers to by name. Marks the current cycle. |
 | `linear_prepare_write` | `confirm` | Validates and stages a change, returns a preview and its expiry. **Writes nothing.** |
-| `linear_commit_write` | `confirm` | Applies the change staged in the calling conversation. |
-| `linear_write` | `direct` | Validates a change and applies it at once. |
+| `linear_commit_write` | `confirm` | Applies the change staged in the calling conversation. **Writes.** |
+| `linear_write` | `direct` | Validates a change and applies it at once. **Writes.** |
+
+The manifest declares each tool's effect (`capabilities[].side_effects`): the
+three readers and `linear_prepare_write` are `read`, the two that change
+Linear are `write`. The kernel checks a `write` against the turn's discretion
+labels before it runs.
 
 Editable: state, assignee, priority, title, description, labels. Not editable:
 project, cycle, estimate, parent — an issue's project and cycle are shown and
@@ -186,28 +213,26 @@ conversation: one that shows the preview, one that brings the user's yes.
 1. `linear_prepare_write` resolves every name to a Linear record, validates the
    change, renders a preview and stages it for the calling conversation.
    Nothing in Linear changes. The result is `{ preview, expiresAt }`.
-2. The Linear agent ends its turn. The orchestrator shows the user the preview
-   and asks.
-3. The user confirms. The orchestrator asks the Linear agent again and says
-   so. `linear_commit_write` takes no input: it applies the change staged for
-   the calling conversation, removing it from the store first.
+2. The agent shows the user the preview, says that nothing is written yet,
+   asks, and ends its turn.
+3. The user confirms in a later message. The agent calls
+   `linear_commit_write`, which takes no input: it applies the change staged
+   for the calling conversation, removing it from the store first.
 
 ### Who is calling
 
-A tool gets its input and nothing else as an argument, and the Linear agent is
-stateless: `LocalSubAgent.ask()` starts each call with a single user message.
-What connects step 3 to step 1 is the host's **turn context**, a service
+A tool gets its input and nothing else as an argument. What connects step 3
+to step 1 is the host's **turn context**, a service
 published as the capability `turnContext@1` (`optional_requires:` in the
 manifest, read in `src/caller.ts`). For the call in flight it names the agent,
 the user, the session and the turn. The first three together are the
 conversation a prepared write is staged under; the turn is what tells a commit
 made after the user answered from one made before.
 
-That is why no handle travels with the conversation. An earlier version
-returned a token that the Linear agent had to hand to the orchestrator, the
-orchestrator had to write into its answer, and the next turn had to bring back
-— past a privacy filter that masks strings in tool results, and across a turn
-boundary that keeps only the answer text. Every station could lose it.
+That is why no handle travels with the conversation. A token the model had to
+carry from the preview to the commit would pass a privacy filter that masks
+strings in tool results, and a turn boundary that keeps only the answer text;
+either could lose it.
 
 Properties this buys, and where they are enforced (`src/preparedWrites.ts`):
 
@@ -217,8 +242,9 @@ Properties this buys, and where they are enforced (`src/preparedWrites.ts`):
 - **It belongs to its conversation.** A commit from another conversation,
   another user or another agent finds nothing.
 - **Not in the turn that prepared.** `take()` refuses a commit whose turn is
-  the one that staged the write, and leaves the write where it is. The prompt
-  says the same, but this half no longer depends on the model following it.
+  the one that staged the write, and leaves the write where it is. The tool
+  description says the same, but this half does not depend on the model
+  following it.
 - **One per conversation.** A second prepare in the same turn is refused: of
   two previews made in one turn, nobody could say which one the user saw. A
   prepare in a later turn replaces the earlier one. Several changes asked for
@@ -236,18 +262,17 @@ Properties this buys, and where they are enforced (`src/preparedWrites.ts`):
   `close()` clears it.
 
 **"No" does not discard a prepared change.** When the user declines, the
-orchestrator usually answers without calling the Linear agent, so the change
-stays staged. It ends in one of three ways: it expires after ten minutes, a
+agent answers without calling a tool, so the change stays staged. It ends in one of three ways: it expires after ten minutes, a
 newer prepare in the same conversation replaces it, or it is committed. Until
 then a later yes in the same conversation could still apply it — the preview
 the user declined.
 
 What the gate does **not** decide is whether the user said yes. That is the
-orchestrator's reading of the user's message, and the Linear agent's reading
-of the orchestrator's question. `playbook.when_to_use` in the manifest carries
-the orchestrator's half of the rule — it becomes the description of
-`query_linear`, the one text of this package the orchestrator reads before it
-calls — and `skills/linear-expert.md` carries the agent's half.
+agent's reading of the user's message. Every agent the tools are granted to
+reads the rule in the descriptions of `linear_prepare_write` and
+`linear_commit_write`; an agent made from a template also has it, with the
+rest of the working rules, in its instructions (`agent_templates:` in the
+manifest).
 
 ### Where a change cannot be confirmed
 
@@ -268,24 +293,22 @@ only until when it can be confirmed.
 
 Two things follow. A result carries no instruction: a text field is shown to
 the user and masked for the model, so the one reader it was written for never
-gets it. And the prompt partial is written for both forms of a result: it
-tells the agent to quote a preview it can read, and to point at the result
-when the preview is masked.
+gets it. And how a model answers from a digest is the kernel's to tell it;
+the templates only say what the Linear results mean.
 
 A masked value is not an uncertain one. Of a commit result a model reads
 `committed` and the issue key, and nothing of the title, the state or the
 priority. Left to itself it reports that as "could not be checked" and asks
-the user to look. The prompt partial and `playbook.when_to_use` therefore say
-what `committed: true` means: Linear took the whole change, exactly as the
-preview showed it, and the answer states that as fact.
+the user to look. The templates therefore say what `committed: true` means:
+Linear took the whole change, and the answer states that as fact.
 
 ## Layout
 
 ```
-manifest.yaml            identity, depends_on + requires, the setup fields, playbook, skills
-skills/linear-expert.md  system prompt: how results arrive, vocabulary, writes per mode, how to answer
-src/plugin.ts            activate(ctx) -> { toolkit, close }; reads the write mode
-src/toolkit.ts           the tools: schemas, validation, resolve and apply
+manifest.yaml            identity, depends_on + requires, setup fields, tool effects, playbook, agent templates
+src/plugin.ts            activate(ctx) -> { close }; reads the write mode, registers the tools
+src/registerTools.ts     tool -> NativeToolSpec (JSON schema via z.toJSONSchema) + handler
+src/toolkit.ts           the tools: schemas, input check, resolve and apply
 src/caller.ts            which conversation and turn a call belongs to
 src/lookup.ts            name -> id, with a 5-minute cache and no guessing
 src/preview.ts           descriptor -> the sentence a person says yes to
@@ -308,18 +331,19 @@ through tsconfig `paths`. If the connection package has not been built, the
 Linear types resolve to nothing — run its `npm run build` first.
 
 `zod` and `@omadia/plugin-api` are host-provided peers and are kept **external**
-in the bundle. Inlining zod would be the subtle one: the kernel's tool bridge
-reads Zod's `_def` internals to derive each tool's JSON schema, and a schema
-built by a second zod instance would silently come out as `{}` — the tools would
-appear with no arguments at all.
+in the bundle; the host ships zod 4, whose `z.toJSONSchema` builds the tools'
+input schemas.
 
 ## Notes on decisions that are not obvious from the code
 
-- **No `capabilities:` block in the manifest.** For a `kind: agent` plugin the
-  loader reads capability entries only to resolve the `canvas_output`,
-  `deterministic_action` and `event_emit` flags, none of which apply here; the
-  tools the model sees come from the toolkit. Declaring all five a second time
-  as JSON Schema would be a copy with nothing to keep it honest.
+- **The `capabilities:` block declares effects only.** Each entry is a tool id
+  and its `side_effects`; the tools themselves, with their input schemas, come
+  from the toolkit at activation. Declaring the schemas a second time in the
+  manifest would be a copy with nothing to keep it honest. A test holds the
+  list to the toolkit's ids in every write mode.
+- **`compat.core: ">=1.78.0 <2.0"`** (omadia 0.219 and later). The first
+  kernel that knows the capability kinds, `agent_templates:` and
+  `side_effects`.
 - **`self_test: false`, and no connection check of its own.** Whether the API
   key works is the Linear connection's answer: it exports the check core runs
   after every activation and shows in the Store. This plugin holds no
@@ -336,16 +360,18 @@ appear with no arguments at all.
   the manifest (`depends_on`, `requires`), and the connection is imported for
   its types only.
 - **`linear_prepare_write` and `linear_write` take an enum `kind` plus flat optional fields**
-  rather than the discriminated union its three shapes are asking for. The
-  host's Zod-to-JSON-schema bridge degrades a union to `{}` without warning, so
-  the per-kind field rules are enforced in `validateWriteInput` instead — and a
-  field that does not belong to the given kind is an error rather than being
-  quietly dropped.
-- **Every tool input is `.strict()`.** Zod's default is to strip an undeclared
-  key, so `state` instead of `stateName` would be dropped and the preview would
-  faithfully describe a write that omits the change the user asked for. Strict
-  turns a typo into an error the model can see. The kernel's schema bridge
-  ignores the flag, so the published tool definitions are unchanged.
+  rather than the discriminated union its three shapes are asking for. A
+  union becomes an `anyOf` in the JSON schema, which models fill in less
+  reliably than one flat object, so the per-kind field rules are enforced in
+  `validateWriteInput` instead — and a field that does not belong to the given
+  kind is an error rather than being quietly dropped.
+- **Every tool input is `.strict()`, and checked by the tool.** Zod's default
+  is to strip an undeclared key, so `state` instead of `stateName` would be
+  dropped and the preview would faithfully describe a write that omits the
+  change the user asked for. The kernel does not validate a plugin tool's
+  input, and it withholds the message of a thrown `ZodError`, so each tool
+  checks its input itself and answers a mismatch with a refusal that names
+  the field (`Invalid input — <root>: Unrecognized key: "state"`).
 - **Ambiguity is never resolved by guessing.** Two people called Kim, or a state
   name matching two states, is an error that lists the candidates. A preview is
   shown to a person as fact, so picking the first match would state a decision

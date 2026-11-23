@@ -163,8 +163,9 @@ export function createLinearLookups(opts: LinearLookupsOptions): LinearLookups {
     const wanted = spec.trim();
     // "me" is the key's owner, not the person talking: every call this plugin
     // makes acts as that one account (no per-user identity without OAuth), so
-    // "assign it to me" can only mean the key owner. The prompt partial says
-    // so in as many words — this is the code half of that promise.
+    // "assign it to me" can only mean the key owner. The field descriptions
+    // and the agent templates say so in as many words — this is the code half
+    // of that promise.
     if (wanted.toLowerCase() === 'me') return viewer();
 
     const candidates = (await users()).filter((u) => u.active);

@@ -198,7 +198,7 @@ export function createPreparedWriteStore(
       if (waiting !== undefined && waiting.expiresAt > now() && waiting.preparedInTurn === caller.turn) {
         throw new PreparedWriteError(
           `A change is already waiting for the user's confirmation ('${quoted(waiting.preview, MAX_PENDING_PREVIEW_CHARS)}'). ` +
-            'Nothing new was prepared. One change per confirmation: hand that one off now, name the ' +
+            'Nothing new was prepared. One change per confirmation: show the user that one now, name the ' +
             'changes still to come in your answer, and prepare the next one once this one is committed.',
         );
       }
@@ -236,8 +236,8 @@ export function createPreparedWriteStore(
       if (entry.preparedInTurn === caller.turn) {
         throw new PreparedWriteError(
           'This change was prepared in this same turn, so the user has not seen its preview yet. ' +
-            'Nothing was written. Hand off the preview and end your turn; commit when a later ' +
-            'question says the user confirmed.',
+            'Nothing was written. Show the user the preview and end your turn; commit when the user ' +
+            'has confirmed it in a later message.',
         );
       }
       // Removed before it is returned, so the entry is gone whatever the

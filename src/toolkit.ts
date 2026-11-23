@@ -39,20 +39,17 @@ import {
  * The Linear tools: three that read, and the write tools of the active
  * write mode.
  *
- * Shape and constraints come from the host, not from taste:
+ * A tool is `{ id, description, input: ZodSchema, run }`. `registerTools.ts`
+ * hands each one to the kernel with `ctx.tools.register`, and the kernel
+ * offers it to every agent the operator granted this plugin to. That agent
+ * talks to the user itself, so a description here is written for the agent
+ * that answers the user. This file returns no prompt and builds no LLM client.
  *
- *   - A tool is `{ id, description, input: ZodSchema, run }`. The kernel bridges
- *     it into a sub-agent tool, derives the orchestrator-facing tool name from
- *     the plugin id (`@omadia/agent-linear` becomes `query_linear`) and composes
- *     the system prompt from `skills/` plus the manifest. This file returns no
- *     prompt and builds no LLM client.
- *   - The Zod to JSON-schema bridge understands Object, String, Number, Boolean,
- *     Enum, Array, Optional, Nullable, Default, Literal and Effects. Union,
- *     DiscriminatedUnion, Record and Tuple silently degrade to `{}` and the
- *     model then gets no schema at all. That is why `linear_prepare_write` takes
- *     an Enum `kind` plus flat optional fields instead of the discriminated
- *     union the three write shapes are begging for; the per-kind field rules are
- *     enforced in code (see `validateWriteInput`) rather than in the type.
+ * `linear_prepare_write` takes an Enum `kind` plus flat optional fields instead
+ * of the discriminated union the three write shapes are begging for: a union
+ * becomes an `anyOf` in the tool's JSON schema, which models fill in less
+ * reliably than one flat object. The per-kind field rules are enforced in code
+ * (see `validateWriteInput`) rather than in the type.
  *
  * Every write is the same two steps, `resolveWrite` (validate, resolve every
  * name, no mutation) and `applyWrite` (the only code that mutates). The write
@@ -75,9 +72,8 @@ export function isWriteMode(value: unknown): value is WriteMode {
   return value === 'confirm' || value === 'direct' || value === 'off';
 }
 
-/** Matches the kernel's uploaded-toolkit tool contract. Declared locally so the
- *  package compiles standalone: the zip-upload flow forbids reaching outside
- *  its own tree, and `@omadia/plugin-api` does not export this shape. */
+/** One tool as this package builds it; `registerTools.ts` turns it into the
+ *  kernel's `NativeToolSpec` plus handler. */
 export interface ToolDescriptor<I, O> {
   readonly id: string;
   readonly description: string;
@@ -115,9 +111,7 @@ export interface ToolkitOptions {
 // `assignee`, would have the field silently dropped: the write would be staged
 // without the change, and the preview would describe the write that was staged
 // rather than the one that was asked for. Strict turns that into an
-// `Unrecognized key` the model can see and correct. The kernel's schema bridge
-// ignores the strictness flag, so nothing about the published tool definition
-// changes.
+// `Unrecognized key` the model can see and correct (`parseInput`).
 
 /** Linear's state types. `triage` is the inbox of a team that reviews new
  *  issues before accepting them: an issue created without a state lands
@@ -290,13 +284,8 @@ const writeInput = z.object({
     .describe(
       "Workflow-state name, e.g. 'Done'. Closing an issue is a move to a completed or canceled state.",
     ),
-  // Not `personField.optional().describe(...)`: the host's bridge unwraps an
-  // Optional to its inner schema and only falls back to the outer description
-  // when the inner has none. `personField` already carries one, so a
-  // re-describe after `.optional()` would be silently dropped and this field
-  // would advertise the search wording instead of the write wording. Spelled
-  // out with `.describe()` on the string itself. (Fields below that describe
-  // before `.optional()` are fine — that is the inner schema.)
+  // Its own string rather than `personField`: on a write, 'none' clears the
+  // assignee, which the search wording of `personField` does not say.
   assignee: z
     .string()
     .trim()
@@ -334,7 +323,7 @@ const CLEAR_ASSIGNEE = new Set(['none', 'nobody', 'unassigned']);
 // ---------------------------------------------------------------------------
 
 /** Longest description `linear_get_issue` will return. A single issue must not
- *  be able to fill the sub-agent's context on its own. */
+ *  be able to fill the calling agent's context on its own. */
 const MAX_DESCRIPTION_CHARS = 4_000;
 const MAX_COMMENT_CHARS = 1_000;
 const MAX_COMMENTS_RETURNED = 20;
@@ -413,7 +402,7 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       'your answer. Read-only.',
     input: searchInput as z.ZodType<unknown>,
     async run(raw) {
-      const input = searchInput.parse(raw);
+      const input = parseInput(searchInput, raw);
       const team = await lookups.team(input.teamKey);
       const assignee = await given(input.assignee, (name) => lookups.user(name));
       const creator = await given(input.creator, (name) => lookups.user(name));
@@ -470,7 +459,7 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       'Summarise it for the user rather than pasting it back. Read-only.',
     input: getIssueInput as z.ZodType<unknown>,
     async run(raw) {
-      const { key } = getIssueInput.parse(raw);
+      const { key } = parseInput(getIssueInput, raw);
       log('linear_get_issue', { key });
       const issue = await client.getIssue(key);
       if (!issue) {
@@ -491,7 +480,7 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       'and total counts them all; narrow it with query. Read-only.',
     input: lookupInput as z.ZodType<unknown>,
     async run(raw) {
-      const input = lookupInput.parse(raw);
+      const input = parseInput(lookupInput, raw);
       log('linear_lookup', { kind: input.kind, teamKey: input.teamKey });
       switch (input.kind) {
         case 'teams': {
@@ -543,11 +532,12 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       'Prepare a change to Linear WITHOUT applying it: create an issue, update an issue, or add a comment. ' +
       'Resolves every name you give to a Linear record, validates the change, and returns a human-readable ' +
       'preview and the time until which it can be confirmed. Nothing is written. The change now waits in ' +
-      'this conversation, one at a time, for 10 minutes. Hand the preview off to your caller and ask for ' +
-      'the user to confirm; commit only when a later question says the user confirmed.',
+      'this conversation, one at a time, for 10 minutes. Show the user the preview, say that nothing is ' +
+      'written yet, ask them to confirm and end your turn. Call linear_commit_write only after the user ' +
+      'has said yes in a later message.',
     input: writeInput,
     async run(raw) {
-      const input = writeInput.parse(raw);
+      const input = parseInput(writeInput, raw);
       validateWriteInput(input);
       const caller = opts.caller();
       if (caller === undefined) throw noConversation();
@@ -559,7 +549,7 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
       // the model a digest in which every text is masked, so an instruction in
       // here would be read by the one reader it was not written for. What to
       // do next is said where the model does read it: in this tool's
-      // description and in the prompt partial.
+      // description.
       return {
         preview: entry.preview,
         expiresAt: new Date(entry.expiresAt).toISOString(),
@@ -571,12 +561,12 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
     id: 'linear_commit_write',
     description:
       'Apply the change that linear_prepare_write left waiting in this conversation. Takes no input. Call ' +
-      'this ONLY when the question you are answering says the user confirmed the preview: never to "check ' +
+      'this ONLY when the user has confirmed the preview in a message of their own: never to "check ' +
       'whether it works" and never on your own initiative. It refuses in the turn that prepared the ' +
       'change, because the user cannot have seen the preview yet. A prepared change applies exactly once.',
     input: commitWriteInput,
     async run(raw) {
-      commitWriteInput.parse(raw);
+      parseInput(commitWriteInput, raw);
       const caller = opts.caller();
       if (caller === undefined) throw noConversation();
       // Take before applying: the entry is gone whatever happens next, so a
@@ -594,11 +584,11 @@ export function createToolkit(opts: ToolkitOptions): Toolkit {
     description:
       'Change Linear: create an issue, update an issue, or add a comment. Resolves every name you give to ' +
       'a Linear record, validates the change and applies it AT ONCE; there is no preview and no undo. Call ' +
-      'it once per change, and only for a change the question asks for. When a name is ambiguous or a ' +
-      'value is missing, ask in your answer instead of calling.',
+      'it once per change, and only for a change the user asked for. When a name is ambiguous or a ' +
+      'value is missing, ask the user instead of calling.',
     input: writeInput,
     async run(raw) {
-      const input = writeInput.parse(raw);
+      const input = parseInput(writeInput, raw);
       validateWriteInput(input);
       log('linear_write', { kind: input.kind, issueKey: input.issueKey });
       return applyWrite(await resolveWrite(input, client, lookups), client);
@@ -630,7 +620,34 @@ function noConversation(): LinearAgentError {
   return new LinearAgentError(
     'This call belongs to no conversation, so the user cannot be asked to confirm a change here. ' +
       'Nothing was written. Say that changes with confirmation are not available from here, and that the ' +
-      "operator can set the Linear agent's write mode to apply changes without one.",
+      "operator can set the Linear plugin's write mode to apply changes without one.",
+  );
+}
+
+/** At most this many input issues are listed in a refusal; the rest are counted. */
+const MAX_LISTED_INPUT_ISSUES = 5;
+
+/**
+ * The input of a call, or a refusal that lists what does not fit.
+ *
+ * Validating here rather than leaving it to a thrown `ZodError` matters for
+ * what the model reads: the kernel withholds the message of any error that is
+ * not a refusal, and tells the model the outcome is unknown. A misspelt field
+ * would then cost the model its only hint and leave it unsure whether a write
+ * happened. As a refusal it reads which field is wrong, and that nothing ran.
+ */
+function parseInput<T>(schema: z.ZodType<T>, raw: unknown): T {
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  const { issues } = parsed.error;
+  const listed = issues
+    .slice(0, MAX_LISTED_INPUT_ISSUES)
+    .map((issue) => `${issue.path.length > 0 ? issue.path.map(String).join('.') : '<root>'}: ${issue.message}`)
+    .join('; ');
+  const more =
+    issues.length > MAX_LISTED_INPUT_ISSUES ? ` (+${String(issues.length - MAX_LISTED_INPUT_ISSUES)} more)` : '';
+  throw new LinearAgentError(
+    `Invalid input — ${listed}${more}. Nothing was read or written; correct the call and send it again.`,
   );
 }
 

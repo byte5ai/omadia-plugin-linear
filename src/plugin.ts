@@ -2,13 +2,21 @@ import type { LinearClient } from '@omadia/integration-linear';
 import type { PluginContext } from '@omadia/plugin-api';
 
 import { createCallerReader, type TurnContextService } from './caller.js';
-import { createToolkit, isWriteMode, type Toolkit, type WriteMode } from './toolkit.js';
+import { registerToolkit } from './registerTools.js';
+import { createToolkit, isWriteMode, type WriteMode } from './toolkit.js';
 
 /**
- * `@omadia/agent-linear` — the Linear agent.
+ * `@omadia/agent-linear` — the Linear tools.
  *
- * A `kind: agent` plugin: it owns the tools and the prompt, and holds no
- * credential. Reaching Linear is entirely the connection plugin's job:
+ * A capability plugin of kind `tool` (spec 2042 §5.10, ADR-0014): it registers
+ * the Linear tools with the kernel and holds no credential. The id keeps its
+ * historical `agent-` prefix because installed instances reference it: a new
+ * version under the same id takes over their settings and grants. The plugin
+ * has no persona and no model loop of its own; the former Linear agent ships
+ * as the agent templates in manifest.yaml, which an operator turns into an
+ * agent in the Agent Builder.
+ *
+ * Reaching Linear is entirely the connection plugin's job:
  *
  *     depends_on: ["@omadia/integration-linear"]   secret chain, activation order
  *     requires:   ["linear.api@^2"]                makes ctx.services.get legal
@@ -22,7 +30,7 @@ import { createToolkit, isWriteMode, type Toolkit, type WriteMode } from './tool
  * call omits `teamKey`, and `linear_write_mode`, which decides whether a change
  * waits for the user's confirmation, is applied at once, or is not offered at
  * all. The mode is read here, once: the host reactivates a plugin when its
- * settings change, and the toolkit is built with the write tools of that mode.
+ * settings change, and the tools of that mode are registered.
  *
  * A third declaration is optional: `optional_requires: ["turnContext@1"]`. The
  * confirmation mode asks that host service which conversation and which turn a
@@ -34,17 +42,11 @@ import { createToolkit, isWriteMode, type Toolkit, type WriteMode } from './tool
  * answer, given by its own connection check and shown in the Store. A wrong
  * team key therefore surfaces on the first tool call, as a message naming the
  * keys that do exist.
- *
- * The kernel does the rest: it bridges the toolkit into a sub-agent, derives
- * the orchestrator tool name from this plugin's id (`query_linear`), and
- * composes the system prompt from `skills/linear-expert.md` plus the manifest's
- * `identity.description` and `playbook.when_to_use`. No LLM client, no tool
- * loop and no system-prompt string belongs in this package.
  */
 
-export const AGENT_ID = '@omadia/agent-linear' as const;
+export const PLUGIN_ID = '@omadia/agent-linear' as const;
 
-/** The capability this agent consumes. Must match `requires:` in manifest.yaml
+/** The capability this plugin consumes. Must match `requires:` in manifest.yaml
  *  and `provides:` in the connection's manifest. */
 export const LINEAR_API_SERVICE_NAME = 'linear.api';
 
@@ -62,13 +64,12 @@ export const DEFAULT_WRITE_MODE: WriteMode = 'confirm';
  *  `optional_requires:` in manifest.yaml. */
 export const TURN_CONTEXT_SERVICE_NAME = 'turnContext';
 
-export interface LinearAgentHandle {
-  readonly toolkit: Toolkit;
+export interface LinearToolsHandle {
   close(): Promise<void>;
 }
 
-export async function activate(ctx: PluginContext): Promise<LinearAgentHandle> {
-  ctx.log('activating linear agent');
+export async function activate(ctx: PluginContext): Promise<LinearToolsHandle> {
+  ctx.log('activating linear tools');
 
   const client = ctx.services.get<LinearClient>(LINEAR_API_SERVICE_NAME);
   if (!client) {
@@ -99,22 +100,24 @@ export async function activate(ctx: PluginContext): Promise<LinearAgentHandle> {
     },
   });
 
+  const disposeTools = registerToolkit(ctx.tools, toolkit);
+
   ctx.log(
-    `linear agent ready (default team ${defaultTeamKey}, write mode ${writeMode}, tools: ${toolkit.tools
+    `linear tools ready (default team ${defaultTeamKey}, write mode ${writeMode}, tools: ${toolkit.tools
       .map((t) => t.id)
       .join(', ')})`,
   );
 
   return {
-    toolkit,
     async close(): Promise<void> {
-      ctx.log('deactivating linear agent');
+      ctx.log('deactivating linear tools');
+      disposeTools();
       await toolkit.close();
     },
   };
 }
 
-export default { AGENT_ID, activate };
+export default { PLUGIN_ID, activate };
 
 /**
  * `ctx.config.require` throws when the field is unset, but its message is about

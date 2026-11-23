@@ -936,15 +936,16 @@ describe('linear_prepare_write', () => {
   });
 
   it('says in the tool description what happens next', () => {
-    // The sub-agent is called one stateless question at a time, so the
-    // confirmation arrives in a LATER question. The description is the place
-    // the model reads that, whatever the host does to the result.
+    // The confirmation arrives in a LATER message of the user. The description
+    // is the place the model reads that, whatever the host does to the result
+    // and whichever agent the operator granted the tools to.
     const { toolkit } = setup();
     const tool = toolkit.tools.find((t) => t.id === 'linear_prepare_write');
     assert.ok(tool);
     assert.match(tool.description, /Nothing is written/);
     assert.match(tool.description, /waits in this conversation, one at a time, for 10 minutes/);
-    assert.match(tool.description, /commit only when a later question says the user confirmed/);
+    assert.match(tool.description, /Show the user the preview, say that nothing is written yet, ask them to confirm/);
+    assert.match(tool.description, /Call linear_commit_write only after the user has said yes in a later message/);
   });
 
   it('stages the write for the calling conversation', async () => {
@@ -1330,7 +1331,7 @@ describe('linear_commit_write', () => {
 
     await rejects(
       run(toolkit, 'linear_commit_write', {}),
-      /prepared in this same turn.*Nothing was written.*a later question says the user confirmed/s,
+      /prepared in this same turn.*Nothing was written.*the user has confirmed it in a later message/s,
     );
     assert.deepEqual(mock.mutations(), []);
     assert.equal(store.size(), 1);
@@ -1412,7 +1413,7 @@ describe('write mode direct', () => {
     const tool = toolkit.tools.find((t) => t.id === 'linear_write');
     assert.ok(tool);
     assert.match(tool.description, /applies it AT ONCE; there is no preview and no undo/);
-    assert.match(tool.description, /ask in your answer instead of calling/);
+    assert.match(tool.description, /ask the user instead of calling/);
   });
 
   it('takes the same input as a prepared write', () => {
